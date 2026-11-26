@@ -15,6 +15,8 @@ aarch64-linux-gnu-gcc -static -Os -o "$OUT/rootfs/bin/heartbeat" heartbeat.c
 printf 'exec=/bin/heartbeat\nrestart=always\n' > "$OUT/rootfs/etc/aegis/services/00-heartbeat.svc"
 printf 'exec=/bin/heartbeat\nmin_profile=flagship\n' > "$OUT/rootfs/etc/aegis/services/90-flagship-only.svc"
 rm -f "$OUT/rootfs/etc/aegis/services/99-poweroff.svc"
+aarch64-linux-gnu-gcc -static -Os -o "$OUT/rootfs/bin/memhog" memhog.c
+printf 'exec=/bin/memhog\nrestart=never\nmemory_max=16M\n' > "$OUT/rootfs/etc/aegis/services/50-memhog.svc"
 if [ -n "${POWEROFF:-}" ]; then  # POWEROFF=N: desliga após N s (teste automatizado)
   aarch64-linux-gnu-gcc -static -Os -o "$OUT/rootfs/bin/poweroff-test" poweroff.c
   printf 'exec=/bin/poweroff-test %s\nrestart=never\n' "$POWEROFF" > "$OUT/rootfs/etc/aegis/services/99-poweroff.svc"

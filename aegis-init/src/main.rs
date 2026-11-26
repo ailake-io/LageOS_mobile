@@ -3,6 +3,7 @@
 //!   exec=/usr/bin/foo --flag   (required)
 //!   restart=always|never       (default always)
 //!   min_profile=ultralight|mid|flagship (default ultralight = runs everywhere)
+//!   memory_max=64M             (opcional; cgroup v2 memory.max, só como PID 1)
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::process::Command;
@@ -25,26 +26,33 @@ impl Profile {
     }
 }
 
+/// Aceita "max" ou número com sufixo opcional K/M/G (formato do memory.max do kernel).
+fn parse_mem(v: &str) -> Option<String> {
+    let digits = v.strip_suffix(['K', 'M', 'G']).unwrap_or(v);
+    (v == "max" || (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))).then(|| v.into())
+}
+
 fn mem_total_kb(meminfo: &str) -> Option<u64> {
     meminfo.lines().find(|l| l.starts_with("MemTotal:"))?.split_whitespace().nth(1)?.parse().ok()
 }
 
 #[derive(Debug, PartialEq)]
-struct Service { name: String, argv: Vec<String>, restart: bool, min_profile: Profile }
+struct Service { name: String, argv: Vec<String>, restart: bool, min_profile: Profile, memory_max: Option<String> }
 
 fn parse_service(name: &str, text: &str) -> Result<Service, String> {
-    let (mut argv, mut restart, mut min_profile) = (Vec::new(), true, Profile::UltraLight);
+    let (mut argv, mut restart, mut min_profile, mut memory_max) = (Vec::new(), true, Profile::UltraLight, None);
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
         let (k, v) = line.split_once('=').ok_or(format!("{name}: linha inválida: {line}"))?;
         match k.trim() {
             "exec" => argv = v.split_whitespace().map(String::from).collect(),
             "restart" => restart = match v.trim() { "always" => true, "never" => false, o => return Err(format!("{name}: restart={o}")) },
             "min_profile" => min_profile = Profile::parse(v.trim()).ok_or(format!("{name}: min_profile={v}"))?,
+            "memory_max" => memory_max = Some(parse_mem(v.trim()).ok_or(format!("{name}: memory_max={v}"))?),
             o => return Err(format!("{name}: chave desconhecida {o}")),
         }
     }
     if argv.is_empty() { return Err(format!("{name}: exec ausente")); }
-    Ok(Service { name: name.into(), argv, restart, min_profile })
+    Ok(Service { name: name.into(), argv, restart, min_profile, memory_max })
 }
 
 unsafe extern "C" {
@@ -100,7 +108,8 @@ fn shutdown(pid1: bool, running: &HashMap<i32, (usize, Instant)>, sig: i32) -> !
 }
 
 fn mount_early() {
-    for (src, tgt, fs) in [("proc\0", "/proc\0", "proc\0"), ("sysfs\0", "/sys\0", "sysfs\0"), ("devtmpfs\0", "/dev\0", "devtmpfs\0")] {
+    for (src, tgt, fs) in [("proc\0", "/proc\0", "proc\0"), ("sysfs\0", "/sys\0", "sysfs\0"), ("devtmpfs\0", "/dev\0", "devtmpfs\0"),
+                             ("cgroup2\0", "/sys/fs/cgroup\0", "cgroup2\0")] {
         let _ = fs::create_dir_all(tgt.trim_end_matches('\0'));
         // ponytail: erro ignorado (já montado pelo kernel/initramfs é o caso comum)
         unsafe { mount(src.as_ptr(), tgt.as_ptr(), fs.as_ptr(), 0, std::ptr::null()) };
@@ -112,8 +121,28 @@ fn mount_early() {
     }
 }
 
-fn spawn(s: &Service) -> Option<i32> {
-    match Command::new(&s.argv[0]).args(&s.argv[1..]).spawn() {
+const CGROOT: &str = "/sys/fs/cgroup";
+
+/// Cria /sys/fs/cgroup/<serviço> com limites. None se cgroup indisponível (fora do PID 1).
+fn setup_cgroup(s: &Service) -> Option<String> {
+    let dir = format!("{CGROOT}/{}", s.name);
+    fs::create_dir_all(&dir).ok()?;
+    if let Some(m) = &s.memory_max {
+        if let Err(e) = fs::write(format!("{dir}/memory.max"), m) { eprintln!("[init] {}: memory.max: {e}", s.name); }
+    }
+    Some(format!("{dir}/cgroup.procs"))
+}
+
+fn spawn(s: &Service, cgroups: bool) -> Option<i32> {
+    let mut cmd = Command::new(&s.argv[0]);
+    cmd.args(&s.argv[1..]);
+    if let Some(procs) = cgroups.then(|| setup_cgroup(s)).flatten() {
+        use std::os::unix::process::CommandExt;
+        // filho entra no cgroup antes do exec: netos não escapam. init é single-thread, então
+        // alocar aqui (pós-fork) é seguro.
+        unsafe { cmd.pre_exec(move || fs::write(&procs, "0")) };
+    }
+    match cmd.spawn() {
         Ok(c) => { eprintln!("[init] start {} pid={}", s.name, c.id()); Some(c.id() as i32) }
         Err(e) => { eprintln!("[init] falha {}: {e}", s.name); None }
     }
@@ -122,6 +151,9 @@ fn spawn(s: &Service) -> Option<i32> {
 fn main() {
     let pid1 = std::process::id() == 1;
     if pid1 { mount_early(); }
+    // ponytail: só memory; cpu/io quando houver política de prioridade (perfis)
+    let cgroups = pid1 && fs::write(format!("{CGROOT}/cgroup.subtree_control"), "+memory").is_ok();
+    if pid1 && !cgroups { eprintln!("[init] cgroup v2 indisponível; serviços sem limites"); }
     install_signals();
     let dir = env::args().nth(1).unwrap_or("/etc/aegis/services".into());
     let profile = fs::read_to_string("/proc/meminfo").ok().as_deref().and_then(mem_total_kb)
@@ -141,7 +173,7 @@ fn main() {
 
     let mut running: HashMap<i32, (usize, Instant)> = HashMap::new();
     for (i, s) in services.iter().enumerate() {
-        if let Some(pid) = spawn(s) { running.insert(pid, (i, Instant::now())); }
+        if let Some(pid) = spawn(s, cgroups) { running.insert(pid, (i, Instant::now())); }
     }
 
     loop {
@@ -160,7 +192,7 @@ fn main() {
         if !s.restart { continue; }
         // ponytail: backoff fixo 1s p/ crash-loop; exponencial se necessário
         if started.elapsed() < Duration::from_secs(1) { thread::sleep(Duration::from_secs(1)); }
-        if let Some(p) = spawn(s) { running.insert(p, (i, Instant::now())); }
+        if let Some(p) = spawn(s, cgroups) { running.insert(p, (i, Instant::now())); }
     }
 }
 
@@ -181,5 +213,8 @@ mod tests {
         assert!(!s.restart && s.min_profile == Profile::Mid);
         assert!(parse_service("x", "restart=always").is_err());
         assert!(parse_service("x", "exec=/a\nfoo=1").is_err());
+        assert_eq!(parse_service("x", "exec=/a\nmemory_max=64M").unwrap().memory_max.as_deref(), Some("64M"));
+        assert!(parse_service("x", "exec=/a\nmemory_max=64MB").is_err());
+        assert!(parse_service("x", "exec=/a\nmemory_max=../x").is_err());
     }
 }
