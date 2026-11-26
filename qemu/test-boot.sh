@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Teste de boot automatizado: sobe, checa supervisão, cgroup, disco, zram, log persistente, container AegisDroid e poweroff. Exit 0 = passou.
+# Teste de boot automatizado: sobe, checa supervisão, cgroup, disco, zram, log persistente, container LangeDroid e poweroff. Exit 0 = passou.
 set -uo pipefail
 cd "$(dirname "$0")"
 boots() { [ -f build/data.img ] || { echo 0; return; }; debugfs -R "cat /log/init.log" build/data.img 2>/dev/null | grep -c "perfil de hardware"; }
@@ -8,7 +8,7 @@ log=$(POWEROFF=16 IDLE_FREEZE=2 ./run.sh 90 2>&1); rc=$?
 fail=0
 for want in "perfil de hardware: UltraLight" "start 00-heartbeat pid=" "desligando (poweroff)" \
             "50-memhog saiu (status=9)" "montado /dev/vdb em /data (ext4)" "zram swap ativo: " "montado tmpfs em /run (tmpfs)" \
-            "[droid] pid no namespace=1 hostname=aegisdroid" "[selftest] TUDO PASSOU" "[init] 30-droid-selftest saiu (status=0)"; do
+            "[droid] pid no namespace=1 hostname=langedroid" "[selftest] TUDO PASSOU" "[init] 30-droid-selftest saiu (status=0)"; do
   grep -qF "$want" <<<"$log" || { echo "FALHOU: falta '$want'"; fail=1; }
 done
 [ $rc -eq 124 ] && { echo "FALHOU: timeout (QEMU não desligou)"; fail=1; }

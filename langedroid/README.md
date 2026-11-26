@@ -1,17 +1,17 @@
-# aegisdroid
+# langedroid
 
-Orquestrador do container Android (Blueprint §4A, §5A). Rust, zero dependências. Roda como serviço do `aegis-init`.
+Orquestrador do container Android (Blueprint §4A, §5A). Rust, zero dependências. Roda como serviço do `lange-init`.
 
 ```
-aegisdroid daemon [--idle-freeze SEG] [--payload CMD...]   # padrão: 30s, /bin/droid-payload
-aegisdroid ctl open|close|freeze|thaw|status|stop
-aegisdroid selftest                                         # teste ponta a ponta (usado por qemu/test-boot.sh)
+langedroid daemon [--idle-freeze SEG] [--payload CMD...]   # padrão: 30s, /bin/droid-payload
+langedroid ctl open|close|freeze|thaw|status|stop
+langedroid selftest                                         # teste ponta a ponta (usado por qemu/test-boot.sh)
 ```
 
 ## Container
-- Namespaces novos: pid (payload é PID 1), mount (`/proc` próprio), uts (hostname `aegisdroid`), ipc, net.
+- Namespaces novos: pid (payload é PID 1), mount (`/proc` próprio), uts (hostname `langedroid`), ipc, net.
 - cgroup v2 `/sys/fs/cgroup/android` (irmão dos serviços, p/ ter controlador memory).
-- Controle por `/run/aegisdroid.sock` (modo 0600, só root).
+- Controle por `/run/langedroid.sock` (modo 0600, só root).
 
 ## Ciclo (perfil Ultra-Light)
 | Comando | Efeito |

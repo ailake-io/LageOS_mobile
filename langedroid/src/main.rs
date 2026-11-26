@@ -1,9 +1,9 @@
-//! aegisdroid: orquestrador do container Android do AegisOS (Blueprint §4A, §5A). Zero dependências.
+//! langedroid: orquestrador do container Android do LangeOS (Blueprint §4A, §5A). Zero dependências.
 //!
-//!   aegisdroid daemon [--idle-freeze SEG] [--rootfs DIR] [--payload CMD...]   serviço (root, sob aegis-init)
+//!   langedroid daemon [--idle-freeze SEG] [--rootfs DIR] [--payload CMD...]   serviço (root, sob lange-init)
 //!     --rootfs DIR: raiz Android montada (system + vendor + data); payload padrão vira /init
-//!   aegisdroid ctl <open|close|freeze|thaw|status|stop>         cliente
-//!   aegisdroid selftest                                          teste ponta a ponta contra o daemon
+//!   langedroid ctl <open|close|freeze|thaw|status|stop>         cliente
+//!   langedroid selftest                                          teste ponta a ponta contra o daemon
 //!
 //! Container = payload em namespaces novos (pid, mount, uts, ipc, net) dentro de /sys/fs/cgroup/android.
 //! Ciclo (perfil Ultra-Light): `open` faz cold start ou descongela; `close` congela após SEG ocioso.
@@ -13,7 +13,7 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 use std::{env, fs, thread};
 
-const SOCK: &str = "/run/aegisdroid.sock";
+const SOCK: &str = "/run/langedroid.sock";
 const CG: &str = "/sys/fs/cgroup/android";
 
 unsafe extern "C" {
@@ -151,7 +151,7 @@ impl Container {
                     // modo teste: mesma raiz do host (read-only), só /proc próprio
                     None => mnt("proc", "/proc", "proc", 0, "")?,
                 }
-                sethostname(b"aegisdroid".as_ptr(), 10);
+                sethostname(b"langedroid".as_ptr(), 10);
                 Ok(())
             })
         };
@@ -201,7 +201,7 @@ impl Container {
     /// Timer de ociosidade + detecção de container que morreu sozinho.
     fn tick(&mut self) {
         if let Some(c) = &mut self.child && matches!(c.try_wait(), Ok(Some(_))) {
-            eprintln!("[aegisdroid] container saiu");
+            eprintln!("[langedroid] container saiu");
             self.stop();
         }
         if self.close_at.is_some_and(|t| Instant::now() >= t) {
@@ -211,9 +211,9 @@ impl Container {
                     // freeze só para a CPU; RAM continua ocupada. memory.reclaim empurra as páginas p/ zram.
                     let before = self.mem_kb();
                     let _ = fs::write(cg("memory.reclaim"), (before * 1024).to_string()); // EAGAIN = reclaim parcial, ok
-                    eprintln!("[aegisdroid] ocioso: congelado, RAM {before} KB -> {} KB", self.mem_kb());
+                    eprintln!("[langedroid] ocioso: congelado, RAM {before} KB -> {} KB", self.mem_kb());
                 }
-                Err(e) => eprintln!("[aegisdroid] auto-freeze: {e}"),
+                Err(e) => eprintln!("[langedroid] auto-freeze: {e}"),
             }
         }
     }
@@ -229,7 +229,7 @@ fn daemon(args: &[String]) {
             "--idle-freeze" => idle = it.next().and_then(|v| v.parse().ok()).expect("--idle-freeze SEG"),
             "--rootfs" => rootfs = Some(it.next().expect("--rootfs DIR").clone()),
             "--payload" => { payload = it.by_ref().cloned().collect(); }
-            o => { eprintln!("[aegisdroid] argumento desconhecido: {o}"); std::process::exit(2); }
+            o => { eprintln!("[langedroid] argumento desconhecido: {o}"); std::process::exit(2); }
         }
     }
     if payload.is_empty() { payload = vec![if rootfs.is_some() { "/init" } else { "/bin/droid-payload" }.to_string()]; }
@@ -237,26 +237,26 @@ fn daemon(args: &[String]) {
     // Socket de controle só p/ root: quem fala com ele controla o container.
     // umask antes do bind: o socket já nasce 0600 (sem janela entre bind e chmod).
     let old = unsafe { umask(0o177) };
-    let l = UnixListener::bind(SOCK).unwrap_or_else(|e| { eprintln!("[aegisdroid] bind {SOCK}: {e}"); std::process::exit(1) });
+    let l = UnixListener::bind(SOCK).unwrap_or_else(|e| { eprintln!("[langedroid] bind {SOCK}: {e}"); std::process::exit(1) });
     unsafe { umask(old) };
     use std::os::unix::fs::PermissionsExt;
     if let Err(e) = fs::set_permissions(SOCK, fs::Permissions::from_mode(0o600)) {
-        eprintln!("[aegisdroid] chmod {SOCK}: {e}"); std::process::exit(1);
+        eprintln!("[langedroid] chmod {SOCK}: {e}"); std::process::exit(1);
     }
     l.set_nonblocking(true).unwrap();
     let mut c = Container { payload, rootfs, child: None, state: State::Stopped, idle_freeze: Duration::from_secs(idle), close_at: None };
-    eprintln!("[aegisdroid] pronto em {SOCK} (cold start sob demanda, freeze após {idle}s ocioso)");
+    eprintln!("[langedroid] pronto em {SOCK} (cold start sob demanda, freeze após {idle}s ocioso)");
     loop {
         match l.accept() {
             Ok((s, _)) => {
                 // defesa em profundidade além do 0600: só aceita peer root
-                if peer_uid(&s) != Some(0) { eprintln!("[aegisdroid] conexão recusada: uid {:?}", peer_uid(&s)); continue; }
+                if peer_uid(&s) != Some(0) { eprintln!("[langedroid] conexão recusada: uid {:?}", peer_uid(&s)); continue; }
                 let _ = s.set_nonblocking(false);
                 let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
                 let mut line = String::new();
                 if BufReader::new(&s).read_line(&mut line).is_ok() && !line.trim().is_empty() {
                     let reply = c.handle(line.trim());
-                    eprintln!("[aegisdroid] {} -> {reply}", line.trim());
+                    eprintln!("[langedroid] {} -> {reply}", line.trim());
                     let _ = writeln!(&s, "{reply}");
                 }
             }
@@ -332,10 +332,10 @@ fn main() {
         Some("daemon") => daemon(&args[1..]),
         Some("ctl") if args.len() == 2 => match ctl(&args[1]) {
             Ok(r) => println!("{r}"),
-            Err(e) => { eprintln!("aegisdroid: {SOCK}: {e}"); std::process::exit(1) }
+            Err(e) => { eprintln!("langedroid: {SOCK}: {e}"); std::process::exit(1) }
         },
         Some("selftest") => std::process::exit(if selftest() { 0 } else { 1 }),
-        _ => { eprintln!("uso: aegisdroid daemon [--idle-freeze SEG] [--rootfs DIR] [--payload CMD...] | ctl CMD | selftest"); std::process::exit(2) }
+        _ => { eprintln!("uso: langedroid daemon [--idle-freeze SEG] [--rootfs DIR] [--payload CMD...] | ctl CMD | selftest"); std::process::exit(2) }
     }
 }
 

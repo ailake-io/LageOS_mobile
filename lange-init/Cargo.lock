@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "aegis-init"
+name = "lange-init"
 version = "0.1.0"

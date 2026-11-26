@@ -1,6 +1,6 @@
-# Kernel AegisOS
+# Kernel LangeOS
 
-Linux LTS (padrão 6.18.65, `KVER=` p/ trocar) arm64, `tinyconfig` + `aegis.config`. Tudo built-in, sem módulos.
+Linux LTS (padrão 6.18.65, `KVER=` p/ trocar) arm64, `tinyconfig` + `lange.config`. Tudo built-in, sem módulos.
 
 ```
 ./build.sh        # baixa fonte, configura, compila -> build/Image

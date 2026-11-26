@@ -1,4 +1,4 @@
-// Serviço demo: 3 batidas e sai -> aegis-init reinicia (restart=always).
+// Serviço demo: 3 batidas e sai -> lange-init reinicia (restart=always).
 #include <stdio.h>
 #include <unistd.h>
 int main(void) {

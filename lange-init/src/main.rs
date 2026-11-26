@@ -1,10 +1,10 @@
-//! aegis-init: PID 1 + service supervisor for AegisOS (Blueprint Fase 1).
+//! lange-init: PID 1 + service supervisor for LangeOS (Blueprint Fase 1).
 //! Zero dependencies. Service files: `<dir>/*.svc`, lines `key=value`:
 //!   exec=/usr/bin/foo --flag   (required)
 //!   restart=always|never       (default always)
 //!   min_profile=ultralight|mid|flagship (default ultralight = runs everywhere)
 //!   memory_max=64M             (opcional; cgroup v2 memory.max e memory.swap.max, só como PID 1)
-//! Como PID 1 também: monta /etc/aegis/fstab, liga swap ZRAM, grava log em /data/log/init.log.
+//! Como PID 1 também: monta /etc/lange/fstab, liga swap ZRAM, grava log em /data/log/init.log.
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Mutex;
@@ -239,11 +239,11 @@ fn main() {
     let cgroups = pid1 && fs::write(format!("{CGROOT}/cgroup.subtree_control"), "+memory").is_ok();
     if pid1 && !cgroups { log!("cgroup v2 indisponível; serviços sem limites"); }
     install_signals();
-    let dir = env::args().nth(1).unwrap_or("/etc/aegis/services".into());
+    let dir = env::args().nth(1).unwrap_or("/etc/lange/services".into());
     let mem_kb = fs::read_to_string("/proc/meminfo").ok().as_deref().and_then(mem_total_kb);
     let profile = mem_kb.map(Profile::from_mem_kb).unwrap_or(Profile::UltraLight);
     if pid1 {
-        mount_fstab("/etc/aegis/fstab");
+        mount_fstab("/etc/lange/fstab");
         open_log_file("/data/log/init.log");
         if let Some(kb) = mem_kb { setup_zram(kb); }
     }
@@ -297,8 +297,8 @@ mod tests {
     }
     #[test]
     fn service_file() {
-        let s = parse_service("droid", "# c\nexec=/bin/aegisdroid --lazy\nrestart=never\nmin_profile=mid").unwrap();
-        assert_eq!(s.argv, ["/bin/aegisdroid", "--lazy"]);
+        let s = parse_service("droid", "# c\nexec=/bin/langedroid --lazy\nrestart=never\nmin_profile=mid").unwrap();
+        assert_eq!(s.argv, ["/bin/langedroid", "--lazy"]);
         assert!(!s.restart && s.min_profile == Profile::Mid);
         assert!(parse_service("x", "restart=always").is_err());
         assert!(parse_service("x", "exec=/a\nfoo=1").is_err());
