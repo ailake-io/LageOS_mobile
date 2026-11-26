@@ -12,4 +12,6 @@ QUIET= ../qemu/run.sh 10   # boot com log completo do kernel
 
 Inclui: binder/binderfs, memfd, PSI, cgroups+freezer, namespaces, ZRAM (LZ4), KSM, EROFS, seccomp, Landlock, BPF, hardening KSPP (stackprotector strong, fortify, KASLR, init_on_alloc, freelist hardened).
 
-Ainda não: Rust no kernel (falta `bindgen`), virtio (disco/rede/gpu — entra na etapa 4/7), cgroup v2 controllers além de memory/freezer.
+Disco: virtio-mmio + virtio-blk, ext4 (`/data`).
+
+Ainda não: Rust no kernel (falta `bindgen`), virtio rede/gpu (etapa 7), cgroup v2 controllers além de memory/freezer.

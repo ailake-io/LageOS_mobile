@@ -25,8 +25,8 @@ Revisão do Blueprint e plano prático. Data: 2026-11-26.
 |---|---|---|---|
 | 1 | `aegis-init` (PID 1, supervisor, perfis) | testes + boot QEMU | ✅ |
 | 2 | Kernel LTS próprio enxuto (binder, memfd, psi, cgroups, hardening) | boot QEMU com `kernel/build.sh` | ✅ 6.18.65, Image 6.8 MB |
-| 3 | init: shutdown/reboot por sinal, cgroup v2 por serviço, log | `poweroff` limpo no QEMU (`qemu/test-boot.sh`) | ✅ sinais + cgroup v2 (`memory_max`); log persistente → etapa 4 (precisa disco) |
-| 4 | Rootfs EROFS read-only + ZRAM no boot | boot de EROFS, `zram0` ativo | |
+| 3 | init: shutdown/reboot por sinal, cgroup v2 por serviço, log | `poweroff` limpo no QEMU (`qemu/test-boot.sh`) | ✅ sinais + cgroup v2 (`memory_max`) + log em `/data` |
+| 4 | Rootfs EROFS read-only + ZRAM no boot | boot de EROFS, `zram0` ativo | ✅ `/system` EROFS lz4 ro, `/data` ext4, zram = ½ RAM |
 | 5 | Orquestrador AegisDroid (Rust): namespaces + cgroup freezer, sem Android ainda | congela/descongela container de teste, mede RAM | |
 | 6 | Android real no container (imagem Waydroid/LineageOS) | app Android abre no QEMU | |
 | 7 | Compositor Smithay + launcher mínima (virtio-gpu) | janela nativa + janela Android na tela | |

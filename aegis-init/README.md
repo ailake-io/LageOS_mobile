@@ -10,12 +10,19 @@ PID 1 + supervisor de serviços do AegisOS (Blueprint, Fase 1). Rust, zero depen
 - Lê `<dir>/*.svc` (padrão `/etc/aegis/services`), sobe em ordem alfabética, reinicia (`restart=always`, backoff 1s).
 - `min_profile` pula serviços pesados em aparelhos fracos (ex: AegisDroid em `mid`).
 
+## Boot (como PID 1), em ordem
+1. Monta `/proc`, `/sys`, `/dev`, `/sys/fs/cgroup`.
+2. Monta `/etc/aegis/fstab` (`origem destino tipo [ro|rw]`).
+3. Log: console + `/data/log/init.log` (linhas antes do `/data` ficam em buffer).
+4. Swap ZRAM lz4 com metade da RAM.
+5. Sobe serviços.
+
 ## Formato `.svc`
 ```
 exec=/usr/bin/aegisdroid --lazy
 restart=always          # always|never
 min_profile=mid         # ultralight|mid|flagship
-memory_max=256M         # opcional: cgroup v2 memory.max (K/M/G ou max)
+memory_max=256M         # opcional: cgroup v2 memory.max + memory.swap.max (K/M/G ou max)
 ```
 `exec` divide por espaço (sem aspas/escape).
 
@@ -27,7 +34,7 @@ cargo build --release --target aarch64-unknown-linux-musl   # celular (rust-lld)
 ```
 
 ## Ainda não
-Dependências entre serviços, limites de CPU/IO, log persistente.
+Dependências entre serviços, limites de CPU/IO, rotação do log, tamanho de zram por perfil.
 
 ## Boot no QEMU
 `../qemu/run.sh [timeout]` (`MEM=8192` p/ perfil Flagship). Sair: Ctrl-A, X.
