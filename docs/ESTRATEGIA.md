@@ -37,6 +37,6 @@ Rust dentro do kernel (§2 Camada 1) adiado: precisa `bindgen` + versão Rust ca
 
 ## 4. Processo
 
-- Repositório git (ainda não existe — criar).
+- Repositório: github.com/ailake-io/LageOS_mobile (privado).
 - `qemu/test-boot.sh`: teste de boot automatizado (rodar antes de fechar qualquer etapa).
 - Cada etapa só fecha com entregável verificável da tabela.
