@@ -94,7 +94,7 @@ Para suportar desde um aparelho com 1 GB de RAM até um topo de linha com 16 GB,
 ### A. Gerenciamento Inteligente do Subsistema Android por Perfil
 * **Perfil Ultra-Light (1 GB – 2 GB de RAM):**
   * **Cold Start Sob Demanda:** O subsistema Android e o Google Play Services **não** iniciam no boot do aparelho. O sistema operacional sobe consumindo apenas ~220 MB de RAM.
-  * O contêiner Android só é carregado na memória quando o usuário abre um app Android pela primeira vez e é **hibernado/congelado (`cgroup freezer`)** 30 segundos após o app ser fechado, liberando a RAM imediatamente para o sistema.
+  * O contêiner Android só é carregado na memória quando o usuário abre um app Android pela primeira vez e é **hibernado/congelado (`cgroup freezer`)** 30 segundos após o app ser fechado. Como o freezer só para a CPU, o AegisDroid em seguida força `memory.reclaim` no cgroup, empurrando a RAM do container para o ZRAM comprimido.
   * Uso de *Android Go Configs* (`ro.config.low_ram=true`) dentro do contêiner para reduzir o consumo do ART e do GMS.
 * **Perfil Intermediário (3 GB – 4 GB de RAM):**
   * Inicialização em segundo plano com prioridade baixa (*Idle I/O*) após o boot da interface nativa.

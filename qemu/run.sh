@@ -9,19 +9,22 @@ KERNEL=../kernel/build/Image
 [ -f "$KERNEL" ] || { echo "falta $KERNEL: rode ../kernel/build.sh" >&2; exit 1; }
 
 R=$OUT/rootfs; rm -rf "$R"
-mkdir -p "$R"/{sbin,bin,proc,sys,dev,data,etc/aegis/services}
-(cd ../aegis-init && cargo build -q --release --target aarch64-unknown-linux-musl)
+mkdir -p "$R"/{sbin,bin,proc,sys,dev,data,run,etc/aegis/services}
+for c in aegis-init aegisdroid; do (cd ../$c && cargo build -q --release --target aarch64-unknown-linux-musl); done
 cp ../aegis-init/target/aarch64-unknown-linux-musl/release/aegis-init "$R/sbin/init"
+cp ../aegisdroid/target/aarch64-unknown-linux-musl/release/aegisdroid "$R/bin/aegisdroid"
 cc() { aarch64-linux-gnu-gcc -static -Os -o "$R/bin/$1" "$1.c"; }
-cc heartbeat; cc memhog
-printf '/dev/vdb /data ext4 rw\n' > "$R/etc/aegis/fstab"
+cc heartbeat; cc memhog; cc droid-payload
+printf '/dev/vdb /data ext4 rw\ntmpfs /run tmpfs rw\n' > "$R/etc/aegis/fstab"
 S=$R/etc/aegis/services
 printf 'exec=/bin/heartbeat\nrestart=always\n' > "$S/00-heartbeat.svc"
 printf 'exec=/bin/memhog\nrestart=never\nmemory_max=16M\n' > "$S/50-memhog.svc"
+printf 'exec=/bin/aegisdroid daemon --idle-freeze %s\n' "${IDLE_FREEZE:-30}" > "$S/20-aegisdroid.svc"
 printf 'exec=/bin/heartbeat\nmin_profile=flagship\n' > "$S/90-flagship-only.svc"
 if [ -n "${POWEROFF:-}" ]; then  # POWEROFF=N: desliga após N s (teste automatizado)
   cc poweroff
   printf 'exec=/bin/poweroff %s\nrestart=never\n' "$POWEROFF" > "$S/99-poweroff.svc"
+  printf 'exec=/bin/aegisdroid selftest\nrestart=never\n' > "$S/30-droid-selftest.svc"
 fi
 
 mkfs.erofs --quiet -zlz4 --all-root "$OUT/system.erofs" "$R" >/dev/null

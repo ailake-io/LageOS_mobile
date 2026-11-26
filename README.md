@@ -8,6 +8,7 @@ SO móvel em Rust, leve (512 MB+) e seguro, com compatibilidade Android via cont
 | Dir | O quê |
 |---|---|
 | `aegis-init/` | PID 1 + supervisor de serviços (Rust) |
+| `aegisdroid/` | Orquestrador do container Android (namespaces, freeze, reclaim) |
 | `kernel/` | Kernel Linux LTS enxuto arm64 |
 | `qemu/` | Boot e teste automatizado no QEMU aarch64 |
 

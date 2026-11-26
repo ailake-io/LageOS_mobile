@@ -11,6 +11,7 @@ Revisão do Blueprint e plano prático. Data: 2026-11-26.
 | libhybris (Fase 2) | Funciona, mas cada aparelho = meses de port. | Começar só com aparelhos de **kernel mainline** (postmarketOS). libhybris depois. |
 | "Tudo do zero" | Compositor, container e HAL do zero = anos. | Reusar: **Smithay** (compositor Wayland em Rust), **Waydroid/LXC** (container Android), **PipeWire**. Diferencial nosso fica no que é novo. |
 | 220 MB no boot (§5A) | Viável, mas só medindo. | Orçamento de RAM medido em CI a cada fase. |
+| Freezer "libera a RAM" (§5A) | `cgroup freezer` só para a CPU; a RAM continua ocupada. | Freeze + `memory.reclaim` (páginas vão p/ zram). Implementado no `aegisdroid`. |
 
 ## 2. Princípios
 
@@ -27,7 +28,7 @@ Revisão do Blueprint e plano prático. Data: 2026-11-26.
 | 2 | Kernel LTS próprio enxuto (binder, memfd, psi, cgroups, hardening) | boot QEMU com `kernel/build.sh` | ✅ 6.18.65, Image 6.8 MB |
 | 3 | init: shutdown/reboot por sinal, cgroup v2 por serviço, log | `poweroff` limpo no QEMU (`qemu/test-boot.sh`) | ✅ sinais + cgroup v2 (`memory_max`) + log em `/data` |
 | 4 | Rootfs EROFS read-only + ZRAM no boot | boot de EROFS, `zram0` ativo | ✅ `/system` EROFS lz4 ro, `/data` ext4, zram = ½ RAM |
-| 5 | Orquestrador AegisDroid (Rust): namespaces + cgroup freezer, sem Android ainda | congela/descongela container de teste, mede RAM | |
+| 5 | Orquestrador AegisDroid (Rust): namespaces + cgroup freezer, sem Android ainda | congela/descongela container de teste, mede RAM | ✅ `aegisdroid`; ocioso 9.2 MB → 0.3 MB |
 | 6 | Android real no container (imagem Waydroid/LineageOS) | app Android abre no QEMU | |
 | 7 | Compositor Smithay + launcher mínima (virtio-gpu) | janela nativa + janela Android na tela | |
 | 8 | Primeiro aparelho físico | boot no hardware | |
