@@ -1,6 +1,7 @@
 //! aegisdroid: orquestrador do container Android do AegisOS (Blueprint §4A, §5A). Zero dependências.
 //!
-//!   aegisdroid daemon [--idle-freeze SEG] [--payload CMD...]   serviço (roda sob aegis-init, como root)
+//!   aegisdroid daemon [--idle-freeze SEG] [--rootfs DIR] [--payload CMD...]   serviço (root, sob aegis-init)
+//!     --rootfs DIR: raiz Android montada (system + vendor + data); payload padrão vira /init
 //!   aegisdroid ctl <open|close|freeze|thaw|status|stop>         cliente
 //!   aegisdroid selftest                                          teste ponta a ponta contra o daemon
 //!
@@ -25,6 +26,9 @@ unsafe extern "C" {
     fn close(fd: i32) -> i32;
     fn umask(mask: u32) -> u32;
     fn getsockopt(fd: i32, level: i32, name: i32, val: *mut u8, len: *mut u32) -> i32;
+    fn umount2(target: *const u8, flags: i32) -> i32;
+    fn chdir(path: *const u8) -> i32;
+    fn syscall(n: i64, ...) -> i64;
 }
 const CLONE_NEWNS: i32 = 0x0002_0000;
 const CLONE_NEWUTS: i32 = 0x0400_0000;
@@ -33,11 +37,72 @@ const CLONE_NEWPID: i32 = 0x2000_0000;
 const CLONE_NEWNET: i32 = 0x4000_0000;
 const MS_REC: usize = 0x4000;
 const MS_PRIVATE: usize = 0x4_0000;
+const MS_BIND: usize = 0x1000;
+const MS_NOSUID: usize = 0x2;
+const MS_NOEXEC: usize = 0x8;
+const MNT_DETACH: i32 = 2;
+#[cfg(target_arch = "aarch64")]
+const SYS_PIVOT_ROOT: i64 = 41;
+#[cfg(target_arch = "x86_64")]
+const SYS_PIVOT_ROOT: i64 = 155;
+
+fn cstr(s: &str) -> std::ffi::CString { std::ffi::CString::new(s).unwrap() }
+
+fn mnt(src: &str, tgt: &str, fstype: &str, flags: usize, data: &str) -> std::io::Result<()> {
+    let (src, tgt, fstype, data) = (cstr(src), cstr(tgt), cstr(fstype), cstr(data));
+    let data_ptr = if data.is_empty() { std::ptr::null() } else { data.as_ptr().cast() };
+    if unsafe { mount(src.as_ptr().cast(), tgt.as_ptr().cast(), fstype.as_ptr().cast(), flags, data_ptr) } != 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(std::io::Error::new(e.kind(), format!("mount {tgt:?}: {e}")));
+    }
+    Ok(())
+}
+
+/// Nós de /dev que o container recebe do host (bind). Nada de bloco/GPU/modem: isolamento.
+/// kmsg: logs do init Android aparecem no console do host (debug da etapa 6).
+const DEV_NODES: [&str; 7] = ["null", "zero", "full", "random", "urandom", "tty", "kmsg"];
+
+/// Dentro do mount ns do container: monta /dev, /proc, /sys sob `root` e faz pivot_root.
+fn enter_rootfs(root: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::symlink;
+    let dev = format!("{root}/dev");
+    mnt("tmpfs", &dev, "tmpfs", MS_NOSUID, "mode=0755")?;
+    for n in DEV_NODES {
+        let t = format!("{dev}/{n}");
+        fs::write(&t, "")?;
+        mnt(&format!("/dev/{n}"), &t, "", MS_BIND, "")?;
+    }
+    fs::create_dir(format!("{dev}/pts"))?;
+    mnt("devpts", &format!("{dev}/pts"), "devpts", MS_NOSUID | MS_NOEXEC, "newinstance,ptmxmode=0666,mode=0620")?;
+    symlink("pts/ptmx", format!("{dev}/ptmx"))?;
+    // binderfs próprio do container: binder/hwbinder/vndbinder isolados dos do host
+    fs::create_dir(format!("{dev}/binderfs"))?;
+    mnt("binder", &format!("{dev}/binderfs"), "binder", 0, "")?;
+    for b in ["binder", "hwbinder", "vndbinder"] { symlink(format!("binderfs/{b}"), format!("{dev}/{b}"))?; }
+    // O que o 1º estágio do init Android faria (pulamos: é trabalho do host)
+    fs::create_dir(format!("{dev}/socket"))?;
+    mnt("tmpfs", &format!("{root}/mnt"), "tmpfs", MS_NOSUID, "mode=0755")?;
+    for d in ["vendor", "product"] { fs::create_dir(format!("{root}/mnt/{d}"))?; }
+    mnt("proc", &format!("{root}/proc"), "proc", MS_NOSUID | MS_NOEXEC, "")?;
+    mnt("sysfs", &format!("{root}/sys"), "sysfs", MS_NOSUID | MS_NOEXEC, "")?;
+    // pivot_root(".", "."): empilha raiz antiga sob a nova; umount lazy a remove.
+    mnt(root, root, "", MS_BIND | MS_REC, "")?;
+    let r = cstr(root);
+    let dot = cstr(".");
+    unsafe {
+        if chdir(r.as_ptr().cast()) != 0 || syscall(SYS_PIVOT_ROOT, dot.as_ptr(), dot.as_ptr()) != 0
+            || umount2(dot.as_ptr().cast(), MNT_DETACH) != 0 || chdir(c"/".as_ptr().cast()) != 0 {
+            let e = std::io::Error::last_os_error();
+            return Err(std::io::Error::new(e.kind(), format!("pivot_root {root}: {e}")));
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum State { Stopped, Running, Frozen }
 
-struct Container { payload: Vec<String>, child: Option<Child>, state: State, idle_freeze: Duration, close_at: Option<Instant> }
+struct Container { payload: Vec<String>, rootfs: Option<String>, child: Option<Child>, state: State, idle_freeze: Duration, close_at: Option<Instant> }
 
 fn cg(file: &str) -> String { format!("{CG}/{file}") }
 
@@ -57,6 +122,7 @@ impl Container {
     fn start(&mut self) -> Result<(), String> {
         fs::create_dir_all(CG).map_err(|e| format!("cgroup: {e}"))?;
         let procs = cg("cgroup.procs");
+        let rootfs = self.rootfs.clone();
         let mut cmd = Command::new(&self.payload[0]);
         cmd.args(&self.payload[1..]);
         use std::os::unix::process::CommandExt;
@@ -78,9 +144,13 @@ impl Container {
                     waitpid(pid, &mut st, 0);
                     _exit(if st & 0x7f == 0 { (st >> 8) & 0xff } else { 128 + (st & 0x7f) });
                 }
-                // ponytail: mesma raiz do host (só leitura); pivot_root p/ imagem Android na etapa 6.
-                mount(c"none".as_ptr().cast(), c"/".as_ptr().cast(), std::ptr::null(), MS_REC | MS_PRIVATE, std::ptr::null());
-                mount(c"proc".as_ptr().cast(), c"/proc".as_ptr().cast(), c"proc".as_ptr().cast(), 0, std::ptr::null());
+                // mounts do container não vazam p/ o host
+                mnt("none", "/", "", MS_REC | MS_PRIVATE, "")?;
+                match &rootfs {
+                    Some(r) => enter_rootfs(r)?,
+                    // modo teste: mesma raiz do host (read-only), só /proc próprio
+                    None => mnt("proc", "/proc", "proc", 0, "")?,
+                }
                 sethostname(b"aegisdroid".as_ptr(), 10);
                 Ok(())
             })
@@ -151,15 +221,18 @@ impl Container {
 
 fn daemon(args: &[String]) {
     let mut idle = 30u64;
-    let mut payload = vec!["/bin/droid-payload".to_string()];
+    let mut payload = vec![];
+    let mut rootfs = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--idle-freeze" => idle = it.next().and_then(|v| v.parse().ok()).expect("--idle-freeze SEG"),
+            "--rootfs" => rootfs = Some(it.next().expect("--rootfs DIR").clone()),
             "--payload" => { payload = it.by_ref().cloned().collect(); }
             o => { eprintln!("[aegisdroid] argumento desconhecido: {o}"); std::process::exit(2); }
         }
     }
+    if payload.is_empty() { payload = vec![if rootfs.is_some() { "/init" } else { "/bin/droid-payload" }.to_string()]; }
     let _ = fs::remove_file(SOCK);
     // Socket de controle só p/ root: quem fala com ele controla o container.
     // umask antes do bind: o socket já nasce 0600 (sem janela entre bind e chmod).
@@ -171,7 +244,7 @@ fn daemon(args: &[String]) {
         eprintln!("[aegisdroid] chmod {SOCK}: {e}"); std::process::exit(1);
     }
     l.set_nonblocking(true).unwrap();
-    let mut c = Container { payload, child: None, state: State::Stopped, idle_freeze: Duration::from_secs(idle), close_at: None };
+    let mut c = Container { payload, rootfs, child: None, state: State::Stopped, idle_freeze: Duration::from_secs(idle), close_at: None };
     eprintln!("[aegisdroid] pronto em {SOCK} (cold start sob demanda, freeze após {idle}s ocioso)");
     loop {
         match l.accept() {
@@ -203,7 +276,18 @@ fn peer_uid(s: &UnixStream) -> Option<u32> {
     (r == 0 && len == 12).then_some(cred[1])
 }
 
+/// Espera o daemon abrir o socket (serviços sobem em paralelo no boot).
+fn wait_sock(max: Duration) -> bool {
+    let t = Instant::now();
+    while UnixStream::connect(SOCK).is_err() {
+        if t.elapsed() > max { return false; }
+        thread::sleep(Duration::from_millis(100));
+    }
+    true
+}
+
 fn ctl(cmd: &str) -> std::io::Result<String> {
+    wait_sock(Duration::from_secs(5));
     let mut s = UnixStream::connect(SOCK)?;
     writeln!(s, "{cmd}")?;
     let mut r = String::new();
@@ -216,11 +300,7 @@ fn field<'a>(reply: &'a str, key: &str) -> &'a str {
 }
 
 fn selftest() -> bool {
-    let t = Instant::now();
-    while UnixStream::connect(SOCK).is_err() {
-        if t.elapsed() > Duration::from_secs(5) { eprintln!("[selftest] FAIL daemon não respondeu"); return false; }
-        thread::sleep(Duration::from_millis(100));
-    }
+    if !wait_sock(Duration::from_secs(5)) { eprintln!("[selftest] FAIL daemon não respondeu"); return false; }
     let ok = std::cell::Cell::new(true);
     let step = |name: &str, cmd: &str, want_state: &str, wait: u64| {
         thread::sleep(Duration::from_secs(wait));
@@ -255,7 +335,7 @@ fn main() {
             Err(e) => { eprintln!("aegisdroid: {SOCK}: {e}"); std::process::exit(1) }
         },
         Some("selftest") => std::process::exit(if selftest() { 0 } else { 1 }),
-        _ => { eprintln!("uso: aegisdroid daemon [--idle-freeze SEG] [--payload CMD...] | ctl CMD | selftest"); std::process::exit(2) }
+        _ => { eprintln!("uso: aegisdroid daemon [--idle-freeze SEG] [--rootfs DIR] [--payload CMD...] | ctl CMD | selftest"); std::process::exit(2) }
     }
 }
 

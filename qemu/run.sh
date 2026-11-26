@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Boot AegisOS no QEMU aarch64: kernel próprio + /system EROFS read-only (vda) + /data ext4 persistente (vdb).
-# Sair do QEMU: Ctrl-A depois X.  Uso: [MEM=MB] [POWEROFF=s] [QUIET=] ./run.sh [segundos_timeout]
+# Sair do QEMU: Ctrl-A depois X.  Uso: [MEM=MB] [SMP=n] [POWEROFF=s] [QUIET=] [ANDROID=1] ./run.sh [segundos_timeout]
+# ANDROID=1: + system/vendor do Waydroid (../android/fetch.sh) e container Android aberto no boot.
 # Apagar build/data.img zera os dados persistentes.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -9,7 +10,7 @@ KERNEL=../kernel/build/Image
 [ -f "$KERNEL" ] || { echo "falta $KERNEL: rode ../kernel/build.sh" >&2; exit 1; }
 
 R=$OUT/rootfs; rm -rf "$R"
-mkdir -p "$R"/{sbin,bin,proc,sys,dev,data,run,etc/aegis/services}
+mkdir -p "$R"/{sbin,bin,proc,sys,dev,data,run,android/root,etc/aegis/services}
 for c in aegis-init aegisdroid; do (cd ../$c && cargo build -q --release --target aarch64-unknown-linux-musl); done
 cp ../aegis-init/target/aarch64-unknown-linux-musl/release/aegis-init "$R/sbin/init"
 cp ../aegisdroid/target/aarch64-unknown-linux-musl/release/aegisdroid "$R/bin/aegisdroid"
@@ -19,7 +20,25 @@ printf '/dev/vdb /data ext4 rw\ntmpfs /run tmpfs rw\n' > "$R/etc/aegis/fstab"
 S=$R/etc/aegis/services
 printf 'exec=/bin/heartbeat\nrestart=always\n' > "$S/00-heartbeat.svc"
 printf 'exec=/bin/memhog\nrestart=never\nmemory_max=16M\n' > "$S/50-memhog.svc"
-printf 'exec=/bin/aegisdroid daemon --idle-freeze %s\n' "${IDLE_FREEZE:-30}" > "$S/20-aegisdroid.svc"
+DISKS=(); CMDLINE_EXTRA=
+if [ -n "${ANDROID:-}" ]; then
+  A=../android/build
+  [ -f $A/system.img ] && [ -f $A/vendor.img ] || { echo "falta imagem Android: rode ../android/fetch.sh" >&2; exit 1; }
+  [ -f $A/data.img ] || mkfs.ext4 -q -F $A/data.img 4G  # esparso: ocupa só o usado
+  # vdc/vdd/vde (ordem de enumeração invertida: ver comentário no qemu abaixo)
+  DISKS=(-drive file=$A/data.img,format=raw,if=none,id=adata -device virtio-blk-device,drive=adata
+         -drive file=$A/vendor.img,format=raw,if=none,id=avendor,readonly=on -device virtio-blk-device,drive=avendor
+         -drive file=$A/system.img,format=raw,if=none,id=asys,readonly=on -device virtio-blk-device,drive=asys)
+  printf '/dev/vdc /android/root ext4 ro\n/dev/vdd /android/root/vendor ext4 ro\n/dev/vde /android/root/data ext4 rw\n' >> "$R/etc/aegis/fstab"
+  # 1º estágio do init Android (mknod /dev, fstab, SELinux) é trabalho do host: entra direto no 2º.
+  printf 'exec=/bin/aegisdroid daemon --rootfs /android/root --idle-freeze %s --payload /system/bin/init second_stage\n' "${IDLE_FREEZE:-30}" > "$S/20-aegisdroid.svc"
+  printf 'exec=/bin/aegisdroid ctl open\nrestart=never\n' > "$S/30-android-open.svc"
+  MEM=${MEM:-3072}
+  CMDLINE_EXTRA="printk.devkmsg=on"  # sem ratelimit: logs do init Android completos
+  rm -f "$S"/{00-heartbeat,50-memhog,90-flagship-only}.svc  # sem ruído no log do Android
+else
+  printf 'exec=/bin/aegisdroid daemon --idle-freeze %s\n' "${IDLE_FREEZE:-30}" > "$S/20-aegisdroid.svc"
+fi
 printf 'exec=/bin/heartbeat\nmin_profile=flagship\n' > "$S/90-flagship-only.svc"
 if [ -n "${POWEROFF:-}" ]; then  # POWEROFF=N: desliga após N s (teste automatizado)
   cc poweroff
@@ -31,8 +50,8 @@ mkfs.erofs --quiet -zlz4 --all-root "$OUT/system.erofs" "$R" >/dev/null
 [ -f "$OUT/data.img" ] || mkfs.ext4 -q -F "$OUT/data.img" 64M
 
 # virtio-mmio no virt enumera ao contrário: último -device vira vda. Por isso data antes de system.
-${1:+timeout $1} qemu-system-aarch64 -M virt -cpu cortex-a53 -m "${MEM:-1024}" -nographic -no-reboot \
-  -kernel "$KERNEL" \
+${1:+timeout $1} qemu-system-aarch64 -M virt -cpu cortex-a53 -smp "${SMP:-4}" -m "${MEM:-1024}" -nographic -no-reboot \
+  -kernel "$KERNEL" "${DISKS[@]}" \
   -drive file="$OUT/data.img",format=raw,if=none,id=data -device virtio-blk-device,drive=data \
   -drive file="$OUT/system.erofs",format=raw,if=none,id=sys,readonly=on -device virtio-blk-device,drive=sys \
-  -append "console=ttyAMA0 root=/dev/vda rootfstype=erofs ro init=/sbin/init ${QUIET-quiet} panic=-1"
+  -append "console=ttyAMA0 root=/dev/vda rootfstype=erofs ro init=/sbin/init ${QUIET-quiet} panic=-1 $CMDLINE_EXTRA"

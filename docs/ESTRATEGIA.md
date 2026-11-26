@@ -29,7 +29,7 @@ Revisão do Blueprint e plano prático. Data: 2026-11-26.
 | 3 | init: shutdown/reboot por sinal, cgroup v2 por serviço, log | `poweroff` limpo no QEMU (`qemu/test-boot.sh`) | ✅ sinais + cgroup v2 (`memory_max`) + log em `/data` |
 | 4 | Rootfs EROFS read-only + ZRAM no boot | boot de EROFS, `zram0` ativo | ✅ `/system` EROFS lz4 ro, `/data` ext4, zram = ½ RAM |
 | 5 | Orquestrador AegisDroid (Rust): namespaces + cgroup freezer, sem Android ainda | congela/descongela container de teste, mede RAM | ✅ `aegisdroid`; ocioso 9.2 MB → 0.3 MB |
-| 6 | Android real no container (imagem Waydroid/LineageOS) | app Android abre no QEMU | |
+| 6 | Android real no container (imagem Waydroid/LineageOS) | app Android abre no QEMU | 🔄 init Android 2º estágio roda no container (property service, init.rc); falta servicemanager/zygote |
 | 7 | Compositor Smithay + launcher mínima (virtio-gpu) | janela nativa + janela Android na tela | |
 | 8 | Primeiro aparelho físico | boot no hardware | |
 | 9 | Proxy de permissões, firewall eBPF, AVB | — | |
