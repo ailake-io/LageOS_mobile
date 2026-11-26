@@ -2,6 +2,7 @@
 //!
 //!   langedroid daemon [--idle-freeze SEG] [--rootfs DIR] [--payload CMD...]   serviço (root, sob lange-init)
 //!     --rootfs DIR: raiz Android montada (system + vendor + data); payload padrão vira /init
+//!     --allow-32bit: mantém ABIs 32-bit da imagem (padrão: Android só 64-bit, ver abi64_only)
 //!   langedroid ctl <open|close|freeze|thaw|status|stop>         cliente
 //!   langedroid selftest                                          teste ponta a ponta contra o daemon
 //!
@@ -62,8 +63,58 @@ fn mnt(src: &str, tgt: &str, fstype: &str, flags: usize, data: &str) -> std::io:
 /// kmsg: logs do init Android aparecem no console do host (debug da etapa 6).
 const DEV_NODES: [&str; 7] = ["null", "zero", "full", "random", "urandom", "tty", "kmsg"];
 
+/// Política 64-bit only: remove ABIs 32-bit dos build.prop. Junto com zygote64_only, elimina o
+/// zygote32 residente; núcleos ARMv9 nem executam AArch32. Aplicada em cópias (imagem intacta).
+fn abi64_only(build_prop: &str) -> String {
+    let mut out = String::new();
+    for line in build_prop.lines() {
+        let key = line.split_once('=').map(|(k, _)| k.trim());
+        match key {
+            Some(k) if k.ends_with("cpu.abilist32") => continue,
+            Some(k) if k.ends_with("cpu.abilist") => { out.push_str(k); out.push_str("=arm64-v8a"); }
+            _ => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// init.zygote64_32.rc sem o serviço zygote_secondary (app_process32). A imagem não traz
+/// init.zygote64.rc, então ro.zygote continua zygote64_32 e só o .rc é sobreposto.
+fn zygote64_only(rc: &str) -> String {
+    let mut out = String::new();
+    let mut skip = false;
+    for line in rc.lines() {
+        if line.starts_with("service ") { skip = line.starts_with("service zygote_secondary "); }
+        if !skip { out.push_str(line); out.push('\n'); }
+    }
+    out
+}
+
+/// Arquivos do rootfs a sobrepor (bind) com a política 64-bit. Escreve cópias em /run/langedroid.
+fn prop_overrides(root: &str) -> std::io::Result<Vec<(String, String)>> {
+    let dir = "/run/langedroid";
+    fs::create_dir_all(dir)?;
+    let mut binds = vec![];
+    let files: [(&str, fn(&str) -> String); 4] = [
+        ("system/build.prop", abi64_only),
+        ("vendor/build.prop", abi64_only),
+        ("vendor/odm/etc/build.prop", abi64_only), // odm tem prioridade sobre vendor nas ABIs
+        ("system/etc/init/hw/init.zygote64_32.rc", zygote64_only),
+    ];
+    for (rel, policy) in files {
+        let dst = format!("{root}/{rel}");
+        let Ok(text) = fs::read_to_string(&dst) else { continue };
+        let src = format!("{dir}/{}", rel.replace('/', "_"));
+        fs::write(&src, policy(&text))?;
+        binds.push((src, dst));
+    }
+    Ok(binds)
+}
+
 /// Dentro do mount ns do container: monta /dev, /proc, /sys sob `root` e faz pivot_root.
-fn enter_rootfs(root: &str) -> std::io::Result<()> {
+fn enter_rootfs(root: &str, binds: &[(String, String)]) -> std::io::Result<()> {
+    for (src, dst) in binds { mnt(src, dst, "", MS_BIND, "")?; }
     use std::os::unix::fs::symlink;
     let dev = format!("{root}/dev");
     mnt("tmpfs", &dev, "tmpfs", MS_NOSUID, "mode=0755")?;
@@ -85,6 +136,8 @@ fn enter_rootfs(root: &str) -> std::io::Result<()> {
     for d in ["vendor", "product"] { fs::create_dir(format!("{root}/mnt/{d}"))?; }
     mnt("proc", &format!("{root}/proc"), "proc", MS_NOSUID | MS_NOEXEC, "")?;
     mnt("sysfs", &format!("{root}/sys"), "sysfs", MS_NOSUID | MS_NOEXEC, "")?;
+    // getcon()/selinux_status_open() do servicemanager precisam disso; kernel sem SELinux = ignora
+    let _ = mnt("selinuxfs", &format!("{root}/sys/fs/selinux"), "selinuxfs", MS_NOSUID | MS_NOEXEC, "");
     // pivot_root(".", "."): empilha raiz antiga sob a nova; umount lazy a remove.
     mnt(root, root, "", MS_BIND | MS_REC, "")?;
     let r = cstr(root);
@@ -102,7 +155,7 @@ fn enter_rootfs(root: &str) -> std::io::Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum State { Stopped, Running, Frozen }
 
-struct Container { payload: Vec<String>, rootfs: Option<String>, child: Option<Child>, state: State, idle_freeze: Duration, close_at: Option<Instant> }
+struct Container { payload: Vec<String>, rootfs: Option<String>, abi64: bool, child: Option<Child>, state: State, idle_freeze: Duration, close_at: Option<Instant> }
 
 fn cg(file: &str) -> String { format!("{CG}/{file}") }
 
@@ -123,6 +176,10 @@ impl Container {
         fs::create_dir_all(CG).map_err(|e| format!("cgroup: {e}"))?;
         let procs = cg("cgroup.procs");
         let rootfs = self.rootfs.clone();
+        let binds = match (&rootfs, self.abi64) {
+            (Some(r), true) => prop_overrides(r).map_err(|e| format!("build.prop 64-bit: {e}"))?,
+            _ => vec![],
+        };
         let mut cmd = Command::new(&self.payload[0]);
         cmd.args(&self.payload[1..]);
         use std::os::unix::process::CommandExt;
@@ -147,7 +204,7 @@ impl Container {
                 // mounts do container não vazam p/ o host
                 mnt("none", "/", "", MS_REC | MS_PRIVATE, "")?;
                 match &rootfs {
-                    Some(r) => enter_rootfs(r)?,
+                    Some(r) => enter_rootfs(r, &binds)?,
                     // modo teste: mesma raiz do host (read-only), só /proc próprio
                     None => mnt("proc", "/proc", "proc", 0, "")?,
                 }
@@ -223,10 +280,12 @@ fn daemon(args: &[String]) {
     let mut idle = 30u64;
     let mut payload = vec![];
     let mut rootfs = None;
+    let mut abi64 = true;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--idle-freeze" => idle = it.next().and_then(|v| v.parse().ok()).expect("--idle-freeze SEG"),
+            "--allow-32bit" => abi64 = false,
             "--rootfs" => rootfs = Some(it.next().expect("--rootfs DIR").clone()),
             "--payload" => { payload = it.by_ref().cloned().collect(); }
             o => { eprintln!("[langedroid] argumento desconhecido: {o}"); std::process::exit(2); }
@@ -244,7 +303,7 @@ fn daemon(args: &[String]) {
         eprintln!("[langedroid] chmod {SOCK}: {e}"); std::process::exit(1);
     }
     l.set_nonblocking(true).unwrap();
-    let mut c = Container { payload, rootfs, child: None, state: State::Stopped, idle_freeze: Duration::from_secs(idle), close_at: None };
+    let mut c = Container { payload, rootfs, abi64, child: None, state: State::Stopped, idle_freeze: Duration::from_secs(idle), close_at: None };
     eprintln!("[langedroid] pronto em {SOCK} (cold start sob demanda, freeze após {idle}s ocioso)");
     loop {
         match l.accept() {
@@ -335,7 +394,7 @@ fn main() {
             Err(e) => { eprintln!("langedroid: {SOCK}: {e}"); std::process::exit(1) }
         },
         Some("selftest") => std::process::exit(if selftest() { 0 } else { 1 }),
-        _ => { eprintln!("uso: langedroid daemon [--idle-freeze SEG] [--rootfs DIR] [--payload CMD...] | ctl CMD | selftest"); std::process::exit(2) }
+        _ => { eprintln!("uso: langedroid daemon [--idle-freeze SEG] [--rootfs DIR] [--allow-32bit] [--payload CMD...] | ctl CMD | selftest"); std::process::exit(2) }
     }
 }
 
@@ -348,5 +407,12 @@ mod tests {
         assert_eq!(kv("frozenx 1\nfrozen 0", "frozen"), Some(0));
         assert_eq!(field("ok state=frozen mem_kb=9000 pid=3", "mem_kb"), "9000");
         assert_eq!(field("ok state=frozen", "pid"), "");
+    }
+    #[test]
+    fn abi64() {
+        let p = abi64_only("# c\nro.vendor.product.cpu.abilist=arm64-v8a,armeabi-v7a,armeabi\nro.vendor.product.cpu.abilist32=armeabi-v7a,armeabi\nro.vendor.product.cpu.abilist64=arm64-v8a\nro.zygote=zygote64_32\nfoo=bar\n");
+        assert_eq!(p, "# c\nro.vendor.product.cpu.abilist=arm64-v8a\nro.vendor.product.cpu.abilist64=arm64-v8a\nro.zygote=zygote64_32\nfoo=bar\n");
+        let rc = "service zygote /a64\n    class main\n\nservice zygote_secondary /a32\n    class main\n";
+        assert_eq!(zygote64_only(rc), "service zygote /a64\n    class main\n\n");
     }
 }
