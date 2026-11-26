@@ -23,6 +23,8 @@ unsafe extern "C" {
     fn mount(src: *const u8, target: *const u8, fstype: *const u8, flags: usize, data: *const u8) -> i32;
     fn sethostname(name: *const u8, len: usize) -> i32;
     fn close(fd: i32) -> i32;
+    fn umask(mask: u32) -> u32;
+    fn getsockopt(fd: i32, level: i32, name: i32, val: *mut u8, len: *mut u32) -> i32;
 }
 const CLONE_NEWNS: i32 = 0x0002_0000;
 const CLONE_NEWUTS: i32 = 0x0400_0000;
@@ -159,16 +161,23 @@ fn daemon(args: &[String]) {
         }
     }
     let _ = fs::remove_file(SOCK);
+    // Socket de controle só p/ root: quem fala com ele controla o container.
+    // umask antes do bind: o socket já nasce 0600 (sem janela entre bind e chmod).
+    let old = unsafe { umask(0o177) };
     let l = UnixListener::bind(SOCK).unwrap_or_else(|e| { eprintln!("[aegisdroid] bind {SOCK}: {e}"); std::process::exit(1) });
-    // socket de controle só p/ root: quem fala com ele controla o container
+    unsafe { umask(old) };
     use std::os::unix::fs::PermissionsExt;
-    let _ = fs::set_permissions(SOCK, fs::Permissions::from_mode(0o600));
+    if let Err(e) = fs::set_permissions(SOCK, fs::Permissions::from_mode(0o600)) {
+        eprintln!("[aegisdroid] chmod {SOCK}: {e}"); std::process::exit(1);
+    }
     l.set_nonblocking(true).unwrap();
     let mut c = Container { payload, child: None, state: State::Stopped, idle_freeze: Duration::from_secs(idle), close_at: None };
     eprintln!("[aegisdroid] pronto em {SOCK} (cold start sob demanda, freeze após {idle}s ocioso)");
     loop {
         match l.accept() {
             Ok((s, _)) => {
+                // defesa em profundidade além do 0600: só aceita peer root
+                if peer_uid(&s) != Some(0) { eprintln!("[aegisdroid] conexão recusada: uid {:?}", peer_uid(&s)); continue; }
                 let _ = s.set_nonblocking(false);
                 let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
                 let mut line = String::new();
@@ -183,6 +192,15 @@ fn daemon(args: &[String]) {
         }
         c.tick();
     }
+}
+
+/// uid do processo do outro lado (SO_PEERCRED; struct ucred = pid, uid, gid).
+fn peer_uid(s: &UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    let mut cred = [0u32; 3];
+    let mut len = 12u32;
+    let r = unsafe { getsockopt(s.as_raw_fd(), 1 /* SOL_SOCKET */, 17 /* SO_PEERCRED */, cred.as_mut_ptr().cast(), &mut len) };
+    (r == 0 && len == 12).then_some(cred[1])
 }
 
 fn ctl(cmd: &str) -> std::io::Result<String> {
