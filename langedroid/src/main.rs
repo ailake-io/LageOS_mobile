@@ -198,6 +198,16 @@ fn enter_rootfs(root: &str, binds: &[(String, String)], wayland_dir: Option<&str
         fs::set_permissions(format!("{dev}/binderfs/{b}"), fs::Permissions::from_mode(0o666))?;
         symlink(format!("binderfs/{b}"), format!("{dev}/{b}"))?;
     }
+    // Input estilo Waydroid: hwcomposer escreve wl_*_events nestes FIFOs; InputFlinger (patch Waydroid)
+    // lê. Quem segura as pontas abertas é o daemon no host (hold_input_fifos), ver lá.
+    fs::create_dir(format!("{dev}/input"))?;
+    for f in INPUT_FIFOS {
+        let path = format!("{dev}/input/{f}");
+        // só system (1000: hwcomposer e system_server); app qualquer não injeta toque
+        if unsafe { mknod(cstr(&path).as_ptr() as *const u8, 0o010_000 | 0o660, 0) } != 0 { return Err(std::io::Error::last_os_error()); }
+        std::os::unix::fs::chown(&path, Some(1000), Some(1000))?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o660))?; // umask
+    }
     // O que o 1º estágio do init Android faria (pulamos: é trabalho do host)
     fs::create_dir(format!("{dev}/socket"))?;
     mnt("tmpfs", &format!("{root}/mnt"), "tmpfs", MS_NOSUID, "mode=0755")?;
@@ -230,10 +240,33 @@ fn enter_rootfs(root: &str, binds: &[(String, String)], wayland_dir: Option<&str
     Ok(())
 }
 
+const INPUT_FIFOS: [&str; 4] = ["wl_touch_events", "wl_pointer_events", "wl_keyboard_events", "wl_tablet_events"];
+
+/// Abrir FIFO bloqueia até existir o outro lado: o hwcomposer esperava o InputFlinger, que espera o
+/// SurfaceFlinger, que espera o hwcomposer (deadlock); o Keychord do init também travava. O daemon
+/// abre cada FIFO O_RDWR (leitor+escritor sempre presentes) pelo /proc do container. Fica no host:
+/// fd herdado pelo init do Android chegava ao zygote, que aborta ("Unsupported st_mode ... FIFO").
+/// ponytail: buffer do pipe (64 KB) enche se o InputFlinger não ler; aí o hwcomposer perde eventos.
+fn hold_input_fifos(pid: u32) -> Vec<fs::File> {
+    let t = Instant::now();
+    let mut held = Vec::new();
+    for f in INPUT_FIFOS {
+        let path = format!("/proc/{pid}/root/dev/input/{f}");
+        loop {
+            match fs::OpenOptions::new().read(true).write(true).open(&path) {
+                Ok(file) => { held.push(file); break; }
+                Err(_) if t.elapsed() < Duration::from_secs(5) => thread::sleep(Duration::from_millis(10)),
+                Err(e) => { eprintln!("[langedroid] FIFO de input {f}: {e}"); break; }
+            }
+        }
+    }
+    held
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum State { Stopped, Running, Frozen }
 
-struct Container { payload: Vec<String>, rootfs: Option<String>, wayland_dir: Option<String>, abi64: bool, debug_logcat: bool, props: Vec<(String, String)>, child: Option<Child>, state: State, idle_freeze: Duration, close_at: Option<Instant> }
+struct Container { payload: Vec<String>, rootfs: Option<String>, wayland_dir: Option<String>, abi64: bool, debug_logcat: bool, props: Vec<(String, String)>, child: Option<Child>, fifos: Vec<fs::File>, state: State, idle_freeze: Duration, close_at: Option<Instant> }
 
 fn cg(file: &str) -> String { format!("{CG}/{file}") }
 
@@ -291,7 +324,10 @@ impl Container {
                 Ok(())
             })
         };
-        self.child = Some(cmd.spawn().map_err(|e| format!("spawn: {e}"))?);
+        let child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
+        // intermediário e PID 1 do container dividem o mount ns: o pivot_root vale p/ os dois
+        if self.rootfs.is_some() { self.fifos = hold_input_fifos(child.id()); }
+        self.child = Some(child);
         self.state = State::Running;
         Ok(())
     }
@@ -313,6 +349,7 @@ impl Container {
     fn stop(&mut self) {
         let _ = fs::write(cg("cgroup.kill"), "1"); // mata container inteiro, inclusive o PID 1 dele
         if let Some(mut c) = self.child.take() { let _ = c.wait(); }
+        self.fifos.clear();
         let _ = fs::write(cg("cgroup.freeze"), "0");
         self.state = State::Stopped;
         self.close_at = None;
@@ -391,7 +428,7 @@ fn daemon(args: &[String]) {
         eprintln!("[langedroid] chmod {SOCK}: {e}"); std::process::exit(1);
     }
     l.set_nonblocking(true).unwrap();
-    let mut c = Container { payload, rootfs, wayland_dir, abi64, debug_logcat, props, child: None, state: State::Stopped, idle_freeze: Duration::from_secs(idle), close_at: None };
+    let mut c = Container { payload, rootfs, wayland_dir, abi64, debug_logcat, props, child: None, fifos: Vec::new(), state: State::Stopped, idle_freeze: Duration::from_secs(idle), close_at: None };
     eprintln!("[langedroid] pronto em {SOCK} (cold start sob demanda, freeze após {idle}s ocioso)");
     loop {
         match l.accept() {

@@ -24,10 +24,10 @@ printf 'exec=/bin/heartbeat\nrestart=always\n' > "$S/00-heartbeat.svc"
 printf 'exec=/bin/memhog\nrestart=never\nmemory_max=16M\n' > "$S/50-memhog.svc"
 DISKS=(); CMDLINE_EXTRA=
 QEMU=qemu-system-aarch64
-GPU_DEV=(-device virtio-gpu-device)  # 2D: Mesa renderiza por software (llvmpipe/kms_swrast)
+GPU_DEV=(-device virtio-gpu-device -device virtio-tablet-device)  # 2D: Mesa renderiza por software (llvmpipe/kms_swrast)
 if [ "${GPU:-}" = virgl ]; then
   QEMU=/usr/bin/qemu-system-aarch64  # QEMU do Ubuntu tem virglrenderer; o do Homebrew não
-  GPU_DEV=(-device virtio-gpu-gl-device -display egl-headless)
+  GPU_DEV=(-device virtio-gpu-gl-device -display egl-headless -device virtio-tablet-device)
 fi
 if [ -n "${ANDROID:-}" ]; then
   A=../android/build
@@ -60,8 +60,9 @@ if [ -n "${ANDROID:-}" ]; then
   printf 'exec=/bin/langedroid daemon --rootfs /android/root --idle-freeze %s %s%s--wayland-dir /run/lange --payload /system/bin/init selinux_setup\n' "${IDLE_FREEZE:-30}" "${DEBUG_LOGCAT:+--debug-logcat }" "$GFX_PROPS" > "$S/20-langedroid.svc"
   printf 'exec=/bin/langedroid ctl open\nrestart=never\n' > "$S/30-android-open.svc"
   MEM=${MEM:-3072}
+  # QMP=caminho: socket de controle do QEMU (testes injetam toque e tiram screendump)
   # compositor sobe antes do container (10 < 20); screenshot em /data p/ o teste extrair
-  printf 'exec=/bin/lange-compositor --socket /run/lange/wayland-0 --screenshot /data/screen.ppm\n' > "$S/10-compositor.svc"
+  printf 'exec=/bin/lange-compositor --socket /run/lange/wayland-0 --screenshot /data/compositor/screen.ppm\n' > "$S/10-compositor.svc"
   CMDLINE_EXTRA="printk.devkmsg=on androidboot.selinux=permissive"  # sem ratelimit: logs do init Android completos
   rm -f "$S"/{00-heartbeat,50-memhog,90-flagship-only}.svc  # sem ruído no log do Android
 else
@@ -81,7 +82,7 @@ mkfs.erofs --quiet -zlz4 --all-root "$OUT/system.erofs" "$R" >/dev/null
 # virtio-mmio no virt enumera ao contrário: último -device vira vda. Por isso data antes de system.
 ${1:+timeout $1} $QEMU -M virt -cpu cortex-a53 -smp "${SMP:-4}" -m "${MEM:-1024}" -nographic -no-reboot \
   -global virtio-mmio.force-legacy=false \
-  -kernel "$KERNEL" "${DISKS[@]}" \
+  -kernel "$KERNEL" "${DISKS[@]}" ${QMP:+-qmp unix:$QMP,server=on,wait=off} \
   -drive file="$OUT/data.img",format=raw,if=none,id=data -device virtio-blk-device,drive=data \
   -drive file="$OUT/system.erofs",format=raw,if=none,id=sys,readonly=on -device virtio-blk-device,drive=sys \
   -append "console=ttyAMA0 root=/dev/vda rootfstype=erofs ro init=/sbin/init ${QUIET-quiet} panic=-1 $CMDLINE_EXTRA"

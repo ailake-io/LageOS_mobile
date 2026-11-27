@@ -11,6 +11,7 @@ Revisão do Blueprint e plano prático. Data: 2026-11-26.
 | libhybris (Fase 2) | Funciona, mas cada aparelho = meses de port. | Começar só com aparelhos de **kernel mainline** (postmarketOS). libhybris depois. |
 | "Tudo do zero" | Compositor, container e HAL do zero = anos. | Reusar: **Smithay** (compositor Wayland em Rust), **Waydroid/LXC** (container Android), **PipeWire**. Diferencial nosso fica no que é novo. |
 | 220 MB no boot (§5A) | Viável, mas só medindo. | Orçamento de RAM medido em CI a cada fase. |
+| Input do host no container | O ueventd do Android cria `/dev/input/event*` a partir do `/sys` do host: o container lê o touchscreen direto, sem passar pelo compositor. | Esconder `/sys/class/input` do container (ou /sys filtrado) antes do aparelho real. |
 | SELinux do container (§6.1) | A política SELinux é global no kernel: carregar a sepolicy do Android (necessária p/ `servicemanager`/`apexd`) vale também p/ o host. Hoje: permissivo. | Antes do modo enforcing: política unificada host + container (domínios do LangeOS + sepolicy Android), carregada pelo `lange-init`. |
 | 32-bit (§5) | Núcleos ARMv9 não executam AArch32; zygote32 gasta RAM residente. | Android **64-bit only** por padrão (`langedroid`); `--allow-32bit` + `CONFIG_COMPAT` p/ apps legados. |
 | Freezer "libera a RAM" (§5A) | `cgroup freezer` só para a CPU; a RAM continua ocupada. | Freeze + `memory.reclaim` (páginas vão p/ zram). Implementado no `langedroid`. |
@@ -32,7 +33,7 @@ Revisão do Blueprint e plano prático. Data: 2026-11-26.
 | 4 | Rootfs EROFS read-only + ZRAM no boot | boot de EROFS, `zram0` ativo | ✅ `/system` EROFS lz4 ro, `/data` ext4, zram = ½ RAM |
 | 5 | Orquestrador LangeDroid (Rust): namespaces + cgroup freezer, sem Android ainda | congela/descongela container de teste, mede RAM | ✅ `langedroid`; ocioso 9.2 MB → 0.3 MB |
 | 6 | Android real no container (imagem Waydroid/LineageOS 20) | app Android abre no QEMU | ✅ boot completo em ~2,5 min; Launcher na tela (QEMU `GPU=virgl`) |
-| 7 | Compositor Smithay + launcher mínima (virtio-gpu) | janela nativa + janela Android na tela | 🔄 `lange-compositor` mostra o Android; falta input (toque), launcher nativa |
+| 7 | Compositor Smithay + launcher mínima (virtio-gpu) | janela nativa + janela Android na tela | 🔄 `lange-compositor` mostra o Android abaixo da barra de status nativa; sem root; toque chega ao compositor (virtio-tablet → `wl_touch`) mas o Android ainda não reage. Falta: toque efetivo, launcher nativa com ícones, multitouch, teclado |
 | 8 | Primeiro aparelho físico | boot no hardware | |
 | 9 | Proxy de permissões, firewall eBPF, AVB | — | |
 | 10 | Integração com a distro Langeos desktop (`docs/INTEGRACAO-DESKTOP.md`) | pareamento + clipboard + notificações | planejado |

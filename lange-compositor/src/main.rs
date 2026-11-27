@@ -15,15 +15,14 @@ use std::{env, fs};
 use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufMappingMode, DmabufSyncFlags};
 use smithay::backend::allocator::{Buffer, Format, Fourcc, Modifier};
 use smithay::reexports::drm;
-use smithay::input::{SeatHandler, SeatState};
+use smithay::input::{touch, Seat, SeatHandler, SeatState};
 use smithay::output::{Mode as OutMode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason, ObjectId};
 use smithay::reexports::wayland_server::protocol::{wl_buffer, wl_seat, wl_shm, wl_surface::WlSurface};
-// ponytail: sem wl_seat global nem teclado (input entra com o touch). SeatHandler só p/ xdg_shell;
-// libxkbcommon.a vazia (stub/) satisfaz o -lxkbcommon do crate sem linkar código C.
+// wl_seat só com touch (sem teclado: libxkbcommon é stub, ver stub/).
 use smithay::reexports::wayland_server::{Client, Display, ListeningSocket, Resource};
-use smithay::utils::{Serial, Transform};
+use smithay::utils::{Serial, Transform, SERIAL_COUNTER};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     with_states, with_surface_tree_downward, with_surface_tree_upward, BufferAssignment, CompositorClientState, CompositorHandler,
@@ -167,6 +166,7 @@ fn virtio_readback(card: &Card, dmabuf: &Dmabuf, w: u32, h: u32) -> Result<(), S
     res
 }
 
+static INPUT_LOGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static READBACK_LOGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 fn import_dmabuf(dmabuf: &Dmabuf, card: Option<&Card>) -> Option<Image> {
@@ -182,6 +182,138 @@ fn import_dmabuf(dmabuf: &Dmabuf, card: Option<&Card>) -> Option<Image> {
     let img = read_pixels(map.ptr() as *const u8, map.length(), 0, size.w as usize, size.h as usize, stride, swap, alpha);
     let _ = dmabuf.sync_plane(0, DmabufSyncFlags::END | DmabufSyncFlags::READ);
     img
+}
+
+// ---------- shell nativo: barra de status ----------
+
+/// Altura da barra de status do LangeOS (desenhada pelo compositor; janelas ficam abaixo).
+const BAR: usize = 32;
+
+/// Fonte 3x5 (bit 2 = coluna esquerda), só dígitos e ':'.
+const FONT: [[u8; 5]; 11] = [
+    [7, 5, 5, 5, 7], [2, 6, 2, 2, 7], [7, 1, 7, 4, 7], [7, 1, 7, 1, 7], [5, 5, 7, 1, 1],
+    [7, 4, 7, 1, 7], [7, 4, 7, 5, 7], [7, 1, 1, 1, 1], [7, 5, 7, 5, 7], [7, 5, 7, 1, 7], [0, 2, 0, 2, 0],
+];
+
+/// "HH:MM" UTC. ponytail: sem fuso horário (sem tzdata no rootfs); ler TZ quando houver config de usuário.
+fn clock_now() -> String {
+    let s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    format!("{:02}:{:02}", s / 3600 % 24, s / 60 % 60)
+}
+
+fn status_bar(fb: &mut [u32], fw: usize, text: &str) {
+    const SCALE: usize = 4;
+    let n = (BAR * fw).min(fb.len());
+    fb[..n].fill(0xff1c_2430);
+    let x0 = fw.saturating_sub(text.len() * 4 * SCALE + 8);
+    for (i, c) in text.chars().enumerate() {
+        let g = match c { '0'..='9' => FONT[c as usize - '0' as usize], ':' => FONT[10], _ => continue };
+        for (row, bits) in g.iter().enumerate() {
+            for col in 0..3 {
+                if bits >> (2 - col) & 1 == 0 { continue; }
+                for dy in 0..SCALE { for dx in 0..SCALE {
+                    let (x, y) = (x0 + (i * 4 + col) * SCALE + dx, 6 + row * SCALE + dy);
+                    if x < fw && y < BAR { fb[y * fw + x] = 0xffe8_eef4; }
+                } }
+            }
+        }
+    }
+}
+
+// ---------- input: evdev (toque / tablet absoluto) ----------
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum TouchEv { Down(f64, f64), Motion(f64, f64), Up }
+
+/// Dispositivo evdev absoluto (virtio-tablet no QEMU, touchscreen single-touch no aparelho).
+/// ponytail: single-touch (ABS_X/ABS_Y + BTN_TOUCH/BTN_LEFT); multitouch (ABS_MT_*) depois.
+struct Tablet { file: fs::File, max: (i32, i32), pos: (i32, i32), down: bool, moved: bool, was_down: bool }
+
+const EV_SYN: u16 = 0; const EV_KEY: u16 = 1; const EV_ABS: u16 = 3;
+const BTN_LEFT: u16 = 0x110; const BTN_TOUCH: u16 = 0x14a;
+
+/// EVIOCGABS(abs) = _IOR('E', 0x40 + abs, struct input_absinfo /* 24 bytes */)
+const fn eviocgabs(abs: u64) -> std::ffi::c_ulong { ((2 << 30) | (24 << 16) | ((b'E' as u64) << 8) | (0x40 + abs)) as _ }
+
+impl Tablet {
+    /// Primeiro /dev/input/event* com eixos X e Y absolutos.
+    fn open() -> Option<Tablet> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut names: Vec<_> = fs::read_dir("/dev/input").ok()?.flatten().map(|e| e.path()).collect();
+        names.sort();
+        for path in names.into_iter().filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("event"))) {
+            let Ok(file) = fs::OpenOptions::new().read(true).custom_flags(0o4000 /* O_NONBLOCK */).open(&path) else { continue };
+            let max = |abs| { let mut info = [0i32; 6]; (unsafe { ioctl(file.as_raw_fd(), eviocgabs(abs), info.as_mut_ptr()) } == 0).then_some(info[2]) };
+            if let (Some(mx), Some(my)) = (max(0), max(1)) && mx > 0 && my > 0 {
+                eprintln!("[compositor] input {} (abs {mx}x{my})", path.display());
+                return Some(Tablet { file, max: (mx, my), pos: (0, 0), down: false, moved: false, was_down: false });
+            }
+        }
+        None
+    }
+
+    /// Lê o que houver (não bloqueia) e devolve eventos de toque em pixels da tela.
+    fn read(&mut self, sw: usize, sh: usize) -> Vec<TouchEv> {
+        use std::io::Read;
+        let mut buf = [0u8; 24 * 64];
+        let mut out = Vec::new();
+        while let Ok(n) = self.file.read(&mut buf) && n > 0 {
+            for ev in buf[..n].chunks_exact(24) { self.feed(ev, sw, sh, &mut out); }
+        }
+        if !out.is_empty() && INPUT_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
+            eprintln!("[compositor] toque {out:?}");
+        }
+        out
+    }
+
+    /// struct input_event (64-bit): timeval(16) type(u16) code(u16) value(i32).
+    fn feed(&mut self, ev: &[u8], sw: usize, sh: usize, out: &mut Vec<TouchEv>) {
+        let ty = u16::from_le_bytes([ev[16], ev[17]]);
+        let code = u16::from_le_bytes([ev[18], ev[19]]);
+        let val = i32::from_le_bytes([ev[20], ev[21], ev[22], ev[23]]);
+        match (ty, code) {
+            (EV_ABS, 0) => { self.pos.0 = val; self.moved = true; }
+            (EV_ABS, 1) => { self.pos.1 = val; self.moved = true; }
+            (EV_KEY, BTN_LEFT | BTN_TOUCH) => self.down = val != 0,
+            (EV_SYN, 0) => {
+                let x = self.pos.0.clamp(0, self.max.0) as f64 * sw as f64 / (self.max.0 as f64 + 1.0);
+                let y = self.pos.1.clamp(0, self.max.1) as f64 * sh as f64 / (self.max.1 as f64 + 1.0);
+                match (self.was_down, self.down) {
+                    (false, true) => out.push(TouchEv::Down(x, y)),
+                    (true, false) => out.push(TouchEv::Up),
+                    (true, true) if self.moved => out.push(TouchEv::Motion(x, y)),
+                    _ => {}
+                }
+                self.was_down = self.down;
+                self.moved = false;
+            }
+            _ => {}
+        }
+    }
+}
+
+// ---------- privilégios ----------
+
+/// uid/gid próprio do compositor (fora da faixa do Android, >= 1000). O socket fica 600:1000 0660.
+const COMPOSITOR_UID: u32 = 600;
+const ANDROID_SYSTEM_GID: u32 = 1000;
+
+unsafe extern "C" {
+    fn setgroups(n: usize, list: *const u32) -> i32;
+    fn setgid(g: u32) -> i32;
+    fn setuid(u: u32) -> i32;
+}
+
+/// Larga root depois de abrir DRM, input e socket. Falha = aborta (não roda root por engano).
+fn drop_root() {
+    unsafe {
+        if setgroups(0, std::ptr::null()) != 0 || setgid(COMPOSITOR_UID) != 0 || setuid(COMPOSITOR_UID) != 0 {
+            eprintln!("[compositor] não consegui largar root: {}", std::io::Error::last_os_error());
+            std::process::exit(1);
+        }
+        if setuid(0) == 0 { eprintln!("[compositor] ainda root depois do setuid"); std::process::exit(1); }
+    }
+    eprintln!("[compositor] rodando como uid {COMPOSITOR_UID}");
 }
 
 // ---------- saída: DRM dumb buffer ou headless ----------
@@ -244,7 +376,9 @@ impl Screen {
         let mut out = format!("P6\n{} {}\n255\n", self.w, self.h).into_bytes();
         for p in &self.fb { out.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, *p as u8]); }
         let tmp = format!("{path}.tmp");
-        fs::write(&tmp, out)?;
+        let mut f = fs::File::create(&tmp)?;
+        std::io::Write::write_all(&mut f, &out)?;
+        f.sync_all()?; // QEMU pode ser morto a qualquer hora: o teste lê o disco depois
         fs::rename(tmp, path) // atômico: leitor nunca vê PPM pela metade
     }
 }
@@ -269,6 +403,9 @@ struct App {
     commits: u32,
     /// fd DRM próprio (dup do card0) p/ o readback virtio; None em headless
     card: Option<Card>,
+    seat: Seat<App>,
+    touch_focus: Option<(WlSurface, smithay::utils::Point<f64, smithay::utils::Logical>)>,
+    start: Instant,
 }
 
 impl BufferHandler for App { fn buffer_destroyed(&mut self, _b: &wl_buffer::WlBuffer) {} }
@@ -305,7 +442,7 @@ impl XdgShellHandler for App {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState { &mut self.xdg }
     /// Tela cheia: toda janela recebe o tamanho da saída (celular).
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        let (w, h) = self.size;
+        let (w, h) = (self.size.0, self.size.1 - BAR as i32);
         surface.with_pending_state(|s| {
             s.size = Some((w, h).into());
             s.states.set(xdg_toplevel::State::Activated);
@@ -349,6 +486,7 @@ smithay::delegate_dmabuf!(App);
 smithay::delegate_output!(App);
 smithay::delegate_viewporter!(App);
 smithay::delegate_presentation!(App);
+smithay::delegate_seat!(App);
 
 #[derive(Default)]
 struct ClientState { compositor: CompositorClientState }
@@ -377,33 +515,73 @@ impl App {
         }
     }
 
-    /// Compõe todas as janelas (e subsurfaces) no framebuffer.
-    fn render(&mut self, screen: &mut Screen) {
-        self.import_pending();
-        screen.fb.fill(0xff10_1418); // fundo LangeOS
-        let (fw, fh) = (screen.w, screen.h);
-        let images = &self.images;
+    /// Superfícies com conteúdo em ordem de desenho (fundo -> frente): (superfície, x, y, larg, alt)
+    /// em coordenadas da tela. Janelas começam abaixo da barra de status.
+    fn layers(&self) -> Vec<(WlSurface, i32, i32, usize, usize)> {
+        let mut out = Vec::new();
         for top in self.xdg.toplevel_surfaces() {
-            // upward = ordem de desenho (fundo -> frente). downward é a ordem de clique: com ele o
-            // fundo preto do hwcomposer do Waydroid era desenhado por último e cobria tudo.
+            // upward = ordem de desenho. downward é a ordem de clique: com ele o fundo preto do
+            // hwcomposer do Waydroid era desenhado por último e cobria tudo.
             with_surface_tree_upward(
                 top.wl_surface(),
-                (0, 0),
+                (0, BAR as i32),
                 |_, states, &(x, y)| {
                     let loc = states.cached_state.get::<SubsurfaceCachedState>().current().location;
                     TraversalAction::DoChildren((x + loc.x, y + loc.y))
                 },
                 |surf, states, &(x, y)| {
                     let loc = states.cached_state.get::<SubsurfaceCachedState>().current().location;
-                    let (x, y) = (x + loc.x, y + loc.y);
-                    let Some(img) = images.get(&surf.id()) else { return };
+                    let Some(img) = self.images.get(&surf.id()) else { return };
                     let dst = states.cached_state.get::<ViewportCachedState>().current().dst;
                     let (dw, dh) = dst.map_or((img.w, img.h), |d| (d.w.max(0) as usize, d.h.max(0) as usize));
-                    draw(&mut screen.fb, fw, fh, img, x, y, dw, dh);
+                    out.push((surf.clone(), x + loc.x, y + loc.y, dw, dh));
                 },
                 |_, _, _| true,
             );
         }
+        out
+    }
+
+    /// Superfície mais à frente sob (px,py) e a origem dela na tela (foco do toque).
+    fn surface_at(&self, px: f64, py: f64) -> Option<(WlSurface, smithay::utils::Point<f64, smithay::utils::Logical>)> {
+        self.layers().into_iter().rev()
+            .find(|&(_, x, y, w, h)| px >= x as f64 && py >= y as f64 && px < x as f64 + w as f64 && py < y as f64 + h as f64)
+            .map(|(s, x, y, _, _)| (s, (x as f64, y as f64).into()))
+    }
+
+    /// Compõe barra de status (nativa) + todas as janelas no framebuffer.
+    fn render(&mut self, screen: &mut Screen) {
+        self.import_pending();
+        screen.fb.fill(0xff10_1418); // fundo LangeOS
+        let (fw, fh) = (screen.w, screen.h);
+        for (surf, x, y, dw, dh) in self.layers() {
+            if let Some(img) = self.images.get(&surf.id()) { draw(&mut screen.fb, fw, fh, img, x, y, dw, dh); }
+        }
+        status_bar(&mut screen.fb, fw, &clock_now());
+    }
+
+    /// Evento de toque (coordenadas da tela). Foco fixado no `down`, como no Wayland.
+    fn touch(&mut self, ev: TouchEv) {
+        let Some(t) = self.seat.get_touch() else { return };
+        let time = self.start.elapsed().as_millis() as u32;
+        // id 0: None vira -1 no wl_touch, e o hwcomposer repassa como ABS_MT_TRACKING_ID -1 (= dedo solto)
+        let slot = smithay::backend::input::TouchSlot::from(Some(0));
+        match ev {
+            TouchEv::Down(x, y) => {
+                let focus = self.surface_at(x, y);
+                self.touch_focus = focus.clone();
+                t.down(self, focus, &touch::DownEvent { slot, location: (x, y).into(), serial: SERIAL_COUNTER.next_serial(), time });
+            }
+            TouchEv::Motion(x, y) => {
+                let focus = self.touch_focus.clone();
+                t.motion(self, focus, &touch::MotionEvent { slot, location: (x, y).into(), time });
+            }
+            TouchEv::Up => {
+                self.touch_focus = None;
+                t.up(self, &touch::UpEvent { slot, serial: SERIAL_COUNTER.next_serial(), time });
+            }
+        }
+        t.frame(self);
     }
 
     fn send_frames(&mut self, time_ms: u32) {
@@ -455,6 +633,9 @@ fn main() {
     let formats = FORMATS.iter().map(|&code| Format { code, modifier: Modifier::Linear });
     let dmabuf_global = dmabuf.create_global::<App>(&dh, formats);
 
+    let mut seat_state = SeatState::new();
+    let mut seat = seat_state.new_wl_seat(&dh, "seat0");
+    seat.add_touch();
     let mut app = App {
         compositor: CompositorState::new::<App>(&dh),
         xdg: XdgShellState::new::<App>(&dh),
@@ -463,7 +644,7 @@ fn main() {
         _dmabuf_global: Some(dmabuf_global),
         _viewporter: ViewporterState::new::<App>(&dh),
         _presentation: PresentationState::new::<App>(&dh, 1 /* CLOCK_MONOTONIC */),
-        seat_state: SeatState::new(),
+        seat_state,
         output,
         images: HashMap::new(),
         pending: HashMap::new(),
@@ -471,22 +652,35 @@ fn main() {
         size: (screen.w as i32, screen.h as i32),
         commits: 0,
         card: screen.drm.as_ref().and_then(|(c, _)| c.0.try_clone().ok()).map(Card),
+        seat,
+        touch_focus: None,
+        start: Instant::now(),
     };
     let _ = &app.output;
 
     if let Some(dir) = std::path::Path::new(&socket).parent() { let _ = fs::create_dir_all(dir); }
     let _ = fs::remove_file(&socket);
     let listener = ListeningSocket::bind_absolute(socket.clone().into()).expect("bind socket wayland");
-    // Só o uid/gid 1000 (system do Android no container; sem user ns os uids coincidem) conecta.
+    // Dono = compositor; grupo 1000 (system do Android no container; sem user ns os ids coincidem).
     use std::os::unix::fs::PermissionsExt;
-    if let Err(e) = std::os::unix::fs::chown(&socket, Some(1000), Some(1000))
+    if let Err(e) = std::os::unix::fs::chown(&socket, Some(COMPOSITOR_UID), Some(ANDROID_SYSTEM_GID))
         .and_then(|_| fs::set_permissions(&socket, fs::Permissions::from_mode(0o660))) {
         eprintln!("[compositor] permissões do socket: {e}");
         std::process::exit(1);
     }
+    // screenshot (diagnóstico) é escrito por tmp+rename: o diretório precisa ser nosso
+    if let Some(dir) = shot.as_deref().and_then(|p| std::path::Path::new(p).parent()) {
+        let _ = fs::create_dir_all(dir);
+        let _ = std::os::unix::fs::chown(dir, Some(COMPOSITOR_UID), Some(COMPOSITOR_UID));
+    }
+    let mut tablet = Tablet::open();
+    if tablet.is_none() { eprintln!("[compositor] sem dispositivo de toque"); }
+    drop_root();
     eprintln!("[compositor] pronto em {socket} ({}x{})", screen.w, screen.h);
 
-    let start = Instant::now();
+    let mut minute = clock_now();
+    // diagnóstico do toque (android/test-android.sh): quadro antes do 1º toque e ~4 s após soltar
+    let (mut pre_touch_saved, mut post_touch_at) = (false, None::<Instant>);
     let mut last_shot = Instant::now() - Duration::from_secs(10);
     let mut last_frame = Instant::now() - FRAME;
     let mut best_lit = 0usize; // quadro mais "aceso" já visto -> <screenshot>-max.ppm (diagnóstico)
@@ -497,6 +691,7 @@ fn main() {
         let mut fds = [
             PollFd { fd: listener.as_raw_fd(), events: POLLIN, revents: 0 },
             PollFd { fd: display.backend().poll_fd().as_raw_fd(), events: POLLIN, revents: 0 },
+            PollFd { fd: tablet.as_ref().map_or(-1, |t| t.file.as_raw_fd()), events: POLLIN, revents: 0 },
         ];
         unsafe { poll(fds.as_mut_ptr(), fds.len() as _, if app.dirty { until_frame.max(1) } else { 1000 }) };
 
@@ -504,15 +699,32 @@ fn main() {
             if let Ok(c) = display.handle().insert_client(stream, Arc::new(ClientState::default())) { clients.push(c); }
         }
         let _ = display.dispatch_clients(&mut app);
+        if let Some(t) = &mut tablet {
+            for ev in t.read(screen.w, screen.h) {
+                if let Some(p) = &shot {
+                    if matches!(ev, TouchEv::Down(..)) && !pre_touch_saved {
+                        pre_touch_saved = true;
+                        let _ = screen.screenshot(&p.replace(".ppm", "-pre-touch.ppm"));
+                    }
+                    if ev == TouchEv::Up { post_touch_at = Some(Instant::now() + Duration::from_secs(4)); }
+                }
+                app.touch(ev);
+            }
+        }
+        if clock_now() != minute { minute = clock_now(); app.dirty = true; }
         // ponytail: sem vblank; quadro no máximo a cada FRAME (limita o custo do readback no QEMU)
         if app.dirty && last_frame.elapsed() >= FRAME {
             app.dirty = false;
             last_frame = Instant::now();
             app.render(&mut screen);
             screen.present();
-            app.send_frames(start.elapsed().as_millis() as u32);
+            app.send_frames(app.start.elapsed().as_millis() as u32);
         }
         let _ = display.flush_clients();
+        if let (Some(p), Some(at)) = (&shot, post_touch_at) && Instant::now() >= at {
+            post_touch_at = None;
+            let _ = screen.screenshot(&p.replace(".ppm", "-post-touch.ppm"));
+        }
         if let Some(p) = &shot && last_shot.elapsed() >= Duration::from_secs(2) {
             last_shot = Instant::now();
             if let Err(e) = screen.screenshot(p) { eprintln!("[compositor] screenshot: {e}"); }
@@ -565,6 +777,26 @@ mod tests {
         // conferidos com include/uapi/drm/virtgpu_drm.h (structs de 44 e 8 bytes)
         assert_eq!(VIRTGPU_TRANSFER_FROM_HOST, 0xc02c6446);
         assert_eq!(VIRTGPU_WAIT, 0xc0086448);
+        assert_eq!(eviocgabs(0), 0x80184540); // EVIOCGABS(ABS_X), linux/input.h
+    }
+    #[test]
+    fn tablet_events() {
+        let ev = |ty: u16, code: u16, val: i32| { let mut b = [0u8; 24]; b[16..18].copy_from_slice(&ty.to_le_bytes());
+            b[18..20].copy_from_slice(&code.to_le_bytes()); b[20..24].copy_from_slice(&val.to_le_bytes()); b };
+        let file = fs::File::open("/dev/null").unwrap();
+        let mut t = Tablet { file, max: (32767, 32767), pos: (0, 0), down: false, moved: false, was_down: false };
+        let mut out = Vec::new();
+        for e in [ev(EV_ABS, 0, 16384), ev(EV_ABS, 1, 0), ev(EV_KEY, BTN_LEFT, 1), ev(EV_SYN, 0, 0),
+                  ev(EV_ABS, 1, 32767), ev(EV_SYN, 0, 0), ev(EV_KEY, BTN_LEFT, 0), ev(EV_SYN, 0, 0),
+                  ev(EV_ABS, 0, 1), ev(EV_SYN, 0, 0)] { t.feed(&e, 720, 1280, &mut out); }
+        assert_eq!(out, [TouchEv::Down(360.0, 0.0), TouchEv::Motion(360.0, 1279.9609375), TouchEv::Up]); // movimento sem toque: nada
+    }
+    #[test]
+    fn bar_clock() {
+        let mut fb = vec![0u32; 200 * BAR];
+        status_bar(&mut fb, 200, "12:34");
+        assert!(fb.iter().all(|&p| p == 0xff1c_2430 || p == 0xffe8_eef4));
+        assert!(fb.iter().filter(|&&p| p == 0xffe8_eef4).count() > 50);
     }
     #[test]
     fn size_arg() { assert_eq!(parse_size("720x1280"), Some((720, 1280))); assert_eq!(parse_size("x"), None); }
