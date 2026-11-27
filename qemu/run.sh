@@ -45,6 +45,9 @@ if [ -n "${ANDROID:-}" ]; then
   GFX_PROPS='--prop ro.hardware.egl=mesa --prop ro.hardware.gralloc=gbm --prop gralloc.gbm.device=/dev/dri/renderD128 '
   # kernel mainline não tem ashmem (removido na 5.18): libcutils usa memfd (HWC/FMQ, zygote)
   GFX_PROPS+='--prop sys.use_memfd=true '
+  # QEMU emulado (TCG) é ~10-20x mais lento: Watchdog matava o system_server (Blocked in handler).
+  # Prop feita p/ emuladores (Cuttlefish); só no QEMU, aparelho real mantém os timeouts normais.
+  GFX_PROPS+='--prop ro.hw_timeout_multiplier=10 '
   # virtio-gpu sem virgl não tem driver Mesa 3D: força kms_swrast/llvmpipe (env da Mesa vira prop debug.mesa.* no Android)
   [ "${GPU:-}" = virgl ] || GFX_PROPS+='--prop debug.mesa.loader.driver.override=kms_swrast --prop debug.mesa.gbm.always.software=true --prop debug.mesa.libgl.always.software=true '
   printf 'exec=/bin/langedroid daemon --rootfs /android/root --idle-freeze %s %s%s--wayland-dir /run/lange --payload /system/bin/init selinux_setup\n' "${IDLE_FREEZE:-30}" "${DEBUG_LOGCAT:+--debug-logcat }" "$GFX_PROPS" > "$S/20-langedroid.svc"
