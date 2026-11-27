@@ -45,6 +45,9 @@ if [ -n "${ANDROID:-}" ]; then
   GFX_PROPS='--prop ro.hardware.egl=mesa --prop ro.hardware.gralloc=gbm --prop gralloc.gbm.device=/dev/dri/renderD128 '
   # kernel mainline não tem ashmem (removido na 5.18): libcutils usa memfd (HWC/FMQ, zygote)
   GFX_PROPS+='--prop sys.use_memfd=true '
+  # sem ponte de sensores ainda (HAL Rust, §4B): HAL do Waydroid registra stubs em vez de sair.
+  # Sem isso SensorService espera p/ sempre e o Watchdog mata o system_server.
+  GFX_PROPS+='--prop waydroid.stub_sensors_hal=1 '
   # QEMU emulado (TCG) é ~10-20x mais lento: Watchdog matava o system_server (Blocked in handler).
   # Prop feita p/ emuladores (Cuttlefish); só no QEMU, aparelho real mantém os timeouts normais.
   GFX_PROPS+='--prop ro.hw_timeout_multiplier=10 '
