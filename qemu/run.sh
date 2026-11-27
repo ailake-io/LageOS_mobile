@@ -11,9 +11,10 @@ KERNEL=../kernel/build/Image
 
 R=$OUT/rootfs; rm -rf "$R"
 mkdir -p "$R"/{sbin,bin,proc,sys,dev,data,run,android/root,etc/lange/services}
-for c in lange-init langedroid; do (cd ../$c && cargo build -q --release --target aarch64-unknown-linux-musl); done
+for c in lange-init langedroid lange-compositor; do (cd ../$c && cargo build -q --release --target aarch64-unknown-linux-musl); done
 cp ../lange-init/target/aarch64-unknown-linux-musl/release/lange-init "$R/sbin/init"
 cp ../langedroid/target/aarch64-unknown-linux-musl/release/langedroid "$R/bin/langedroid"
+cp ../lange-compositor/target/aarch64-unknown-linux-musl/release/lange-compositor "$R/bin/lange-compositor"
 cc() { aarch64-linux-gnu-gcc -static -Os -o "$R/bin/$1" "$1.c"; }
 cc heartbeat; cc memhog; cc droid-payload
 printf '/dev/vdb /data ext4 rw\ntmpfs /run tmpfs rw\n' > "$R/etc/lange/fstab"
@@ -35,9 +36,11 @@ if [ -n "${ANDROID:-}" ]; then
   # (carrega a sepolicy do Android, permissiva) que então chama o 2º estágio.
   # gráficos estilo Waydroid: EGL Mesa + gralloc gbm no render node
   GFX_PROPS='--prop ro.hardware.egl=mesa --prop ro.hardware.gralloc=gbm --prop gralloc.gbm.device=/dev/dri/renderD128 '
-  printf 'exec=/bin/langedroid daemon --rootfs /android/root --idle-freeze %s %s%s--payload /system/bin/init selinux_setup\n' "${IDLE_FREEZE:-30}" "${DEBUG_LOGCAT:+--debug-logcat }" "$GFX_PROPS" > "$S/20-langedroid.svc"
+  printf 'exec=/bin/langedroid daemon --rootfs /android/root --idle-freeze %s %s%s--wayland-dir /run/lange --payload /system/bin/init selinux_setup\n' "${IDLE_FREEZE:-30}" "${DEBUG_LOGCAT:+--debug-logcat }" "$GFX_PROPS" > "$S/20-langedroid.svc"
   printf 'exec=/bin/langedroid ctl open\nrestart=never\n' > "$S/30-android-open.svc"
   MEM=${MEM:-3072}
+  # compositor sobe antes do container (10 < 20); screenshot em /data p/ o teste extrair
+  printf 'exec=/bin/lange-compositor --socket /run/lange/wayland-0 --screenshot /data/screen.ppm\n' > "$S/10-compositor.svc"
   CMDLINE_EXTRA="printk.devkmsg=on androidboot.selinux=permissive"  # sem ratelimit: logs do init Android completos
   rm -f "$S"/{00-heartbeat,50-memhog,90-flagship-only}.svc  # sem ruído no log do Android
 else

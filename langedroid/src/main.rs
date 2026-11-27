@@ -3,6 +3,7 @@
 //!   langedroid daemon [--idle-freeze SEG] [--rootfs DIR] [--payload CMD...]   serviço (root, sob lange-init)
 //!     --rootfs DIR: raiz Android montada (system + vendor + data); payload padrão vira /init
 //!     --allow-32bit: mantém ABIs 32-bit da imagem (padrão: Android só 64-bit, ver abi64_only)
+//!     --wayland-dir DIR: socket do compositor do host (ex. /run/lange) visível em /run/user/1000
 //!     --prop K=V: sobrepõe propriedade no vendor/build.prop (repetível)
 //!     --debug-logcat: logcat do Android inteiro em /dev/kmsg (console do host). Só p/ depuração.
 //!   langedroid ctl <open|close|freeze|thaw|status|stop>         cliente
@@ -151,7 +152,7 @@ fn prop_overrides(root: &str, abi64: bool, debug_logcat: bool, props: &[(String,
 }
 
 /// Dentro do mount ns do container: monta /dev, /proc, /sys sob `root` e faz pivot_root.
-fn enter_rootfs(root: &str, binds: &[(String, String)]) -> std::io::Result<()> {
+fn enter_rootfs(root: &str, binds: &[(String, String)], wayland_dir: Option<&str>) -> std::io::Result<()> {
     for (src, dst) in binds { mnt(src, dst, "", MS_BIND, "")?; }
     use std::os::unix::fs::symlink;
     let dev = format!("{root}/dev");
@@ -195,6 +196,13 @@ fn enter_rootfs(root: &str, binds: &[(String, String)]) -> std::io::Result<()> {
     fs::create_dir(format!("{dev}/socket"))?;
     mnt("tmpfs", &format!("{root}/mnt"), "tmpfs", MS_NOSUID, "mode=0755")?;
     for d in ["vendor", "product"] { fs::create_dir(format!("{root}/mnt/{d}"))?; }
+    // Compositor do host: hwcomposer do Waydroid procura $XDG_RUNTIME_DIR/wayland-0 = /run/user/1000
+    if let Some(w) = wayland_dir {
+        mnt("tmpfs", &format!("{root}/run"), "tmpfs", MS_NOSUID, "mode=0755")?;
+        let user = format!("{root}/run/user/1000");
+        fs::create_dir_all(&user)?;
+        mnt(w, &user, "", MS_BIND, "")?;
+    }
     mnt("proc", &format!("{root}/proc"), "proc", MS_NOSUID | MS_NOEXEC, "")?;
     mnt("sysfs", &format!("{root}/sys"), "sysfs", MS_NOSUID | MS_NOEXEC, "")?;
     // getcon()/selinux_status_open() do servicemanager precisam disso; kernel sem SELinux = ignora
@@ -216,7 +224,7 @@ fn enter_rootfs(root: &str, binds: &[(String, String)]) -> std::io::Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum State { Stopped, Running, Frozen }
 
-struct Container { payload: Vec<String>, rootfs: Option<String>, abi64: bool, debug_logcat: bool, props: Vec<(String, String)>, child: Option<Child>, state: State, idle_freeze: Duration, close_at: Option<Instant> }
+struct Container { payload: Vec<String>, rootfs: Option<String>, wayland_dir: Option<String>, abi64: bool, debug_logcat: bool, props: Vec<(String, String)>, child: Option<Child>, state: State, idle_freeze: Duration, close_at: Option<Instant> }
 
 fn cg(file: &str) -> String { format!("{CG}/{file}") }
 
@@ -237,6 +245,7 @@ impl Container {
         fs::create_dir_all(CG).map_err(|e| format!("cgroup: {e}"))?;
         let procs = cg("cgroup.procs");
         let rootfs = self.rootfs.clone();
+        let wayland_dir = self.wayland_dir.clone();
         let binds = match &rootfs {
             Some(r) => prop_overrides(r, self.abi64, self.debug_logcat, &self.props).map_err(|e| format!("overrides: {e}"))?,
             None => vec![],
@@ -265,7 +274,7 @@ impl Container {
                 // mounts do container não vazam p/ o host
                 mnt("none", "/", "", MS_REC | MS_PRIVATE, "")?;
                 match &rootfs {
-                    Some(r) => enter_rootfs(r, &binds)?,
+                    Some(r) => enter_rootfs(r, &binds, wayland_dir.as_deref())?,
                     // modo teste: mesma raiz do host (read-only), só /proc próprio
                     None => mnt("proc", "/proc", "proc", 0, "")?,
                 }
@@ -344,12 +353,14 @@ fn daemon(args: &[String]) {
     let mut abi64 = true;
     let mut debug_logcat = false;
     let mut props = vec![];
+    let mut wayland_dir = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--idle-freeze" => idle = it.next().and_then(|v| v.parse().ok()).expect("--idle-freeze SEG"),
             "--allow-32bit" => abi64 = false,
             "--debug-logcat" => debug_logcat = true,
+            "--wayland-dir" => wayland_dir = Some(it.next().expect("--wayland-dir DIR").clone()),
             "--prop" => {
                 let kv = it.next().and_then(|v| v.split_once('=')).expect("--prop chave=valor");
                 props.push((kv.0.to_string(), kv.1.to_string()));
@@ -371,7 +382,7 @@ fn daemon(args: &[String]) {
         eprintln!("[langedroid] chmod {SOCK}: {e}"); std::process::exit(1);
     }
     l.set_nonblocking(true).unwrap();
-    let mut c = Container { payload, rootfs, abi64, debug_logcat, props, child: None, state: State::Stopped, idle_freeze: Duration::from_secs(idle), close_at: None };
+    let mut c = Container { payload, rootfs, wayland_dir, abi64, debug_logcat, props, child: None, state: State::Stopped, idle_freeze: Duration::from_secs(idle), close_at: None };
     eprintln!("[langedroid] pronto em {SOCK} (cold start sob demanda, freeze após {idle}s ocioso)");
     loop {
         match l.accept() {
@@ -462,7 +473,7 @@ fn main() {
             Err(e) => { eprintln!("langedroid: {SOCK}: {e}"); std::process::exit(1) }
         },
         Some("selftest") => std::process::exit(if selftest() { 0 } else { 1 }),
-        _ => { eprintln!("uso: langedroid daemon [--idle-freeze SEG] [--rootfs DIR] [--allow-32bit] [--debug-logcat] [--prop K=V]... [--payload CMD...] | ctl CMD | selftest"); std::process::exit(2) }
+        _ => { eprintln!("uso: langedroid daemon [--idle-freeze SEG] [--rootfs DIR] [--allow-32bit] [--debug-logcat] [--prop K=V]... [--wayland-dir DIR] [--payload CMD...] | ctl CMD | selftest"); std::process::exit(2) }
     }
 }
 

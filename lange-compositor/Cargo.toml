@@ -1,0 +1,8 @@
+[package]
+name = "lange-compositor"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+smithay = { version = "0.7", default-features = false, features = ["wayland_frontend", "backend_drm"] }

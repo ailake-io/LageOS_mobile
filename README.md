@@ -10,6 +10,7 @@ SO móvel em Rust, leve (512 MB+) e seguro, com compatibilidade Android via cont
 |---|---|
 | `lange-init/` | PID 1 + supervisor de serviços (Rust) |
 | `langedroid/` | Orquestrador do container Android (namespaces, freeze, reclaim) |
+| `lange-compositor/` | Compositor Wayland (Smithay, composição na CPU sobre DRM) |
 | `kernel/` | Kernel Linux LTS enxuto arm64 |
 | `qemu/` | Boot e teste automatizado no QEMU aarch64 |
 
