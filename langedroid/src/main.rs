@@ -45,6 +45,9 @@ unsafe extern "C" {
     fn setpgid(pid: i32, pgid: i32) -> i32;
     fn chroot(path: *const u8) -> i32;
     fn fchdir(fd: i32) -> i32;
+    fn socket(domain: i32, ty: i32, proto: i32) -> i32;
+    fn send(fd: i32, buf: *const u8, len: usize, flags: i32) -> isize;
+    fn recv(fd: i32, buf: *mut u8, len: usize, flags: i32) -> isize;
 }
 const CLONE_NEWNS: i32 = 0x0002_0000;
 const CLONE_NEWUTS: i32 = 0x0400_0000;
@@ -280,6 +283,41 @@ fn hold_input_fifos(pid: u32) -> Vec<fs::File> {
     held
 }
 
+/// Mensagem netlink RTM_NEWLINK: move a interface `ifindex` p/ o net ns do processo `pid`.
+fn netns_move_msg(ifindex: i32, pid: u32) -> Vec<u8> {
+    let mut m = Vec::with_capacity(40);
+    m.extend(40u32.to_ne_bytes()); // nlmsghdr: len
+    m.extend(16u16.to_ne_bytes()); // RTM_NEWLINK
+    m.extend(5u16.to_ne_bytes()); // NLM_F_REQUEST | NLM_F_ACK
+    m.extend([0u8; 8]); // seq, pid
+    m.extend([0u8; 4]); // ifinfomsg: family, pad, type
+    m.extend(ifindex.to_ne_bytes());
+    m.extend([0u8; 8]); // flags, change
+    m.extend(8u16.to_ne_bytes()); // rtattr len
+    m.extend(19u16.to_ne_bytes()); // IFLA_NET_NS_PID
+    m.extend(pid.to_ne_bytes());
+    m
+}
+
+/// Placa de rede do host -> container: o Android (EthernetService + DHCP) configura sozinho.
+/// Quando o net ns morre o kernel devolve a placa ao host.
+/// ponytail: placa inteira p/ o Android; veth + NAT quando o host precisar de rede própria.
+fn give_netdev(name: &str, pid: u32) -> Result<(), String> {
+    let idx: i32 = fs::read_to_string(format!("/sys/class/net/{name}/ifindex")).map_err(|e| format!("{name}: {e}"))?
+        .trim().parse().map_err(|_| "ifindex".to_string())?;
+    let msg = netns_move_msg(idx, pid);
+    unsafe {
+        let fd = socket(16, 3 | 0o2000000, 0); // AF_NETLINK, SOCK_RAW|CLOEXEC, NETLINK_ROUTE
+        if fd < 0 { return Err(format!("netlink: {}", std::io::Error::last_os_error())); }
+        let mut ack = [0u8; 64];
+        let ok = send(fd, msg.as_ptr(), msg.len(), 0) == msg.len() as isize && recv(fd, ack.as_mut_ptr(), ack.len(), 0) >= 20;
+        close(fd);
+        let err = i32::from_ne_bytes(ack[16..20].try_into().unwrap());
+        if !ok || err != 0 { return Err(format!("RTM_NEWLINK {name}: errno {}", -err)); }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum State { Stopped, Running, Frozen }
 
@@ -343,7 +381,14 @@ impl Container {
         };
         let child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
         // intermediário e PID 1 do container dividem o mount ns: o pivot_root vale p/ os dois
-        if self.rootfs.is_some() { self.fifos = hold_input_fifos(child.id()); }
+        if self.rootfs.is_some() {
+            self.fifos = hold_input_fifos(child.id());
+            // sem placa (ex.: QEMU sem -nic) o Android só fica offline
+            match give_netdev("eth0", child.id()) {
+                Ok(()) => eprintln!("[langedroid] rede: eth0 -> container"),
+                Err(e) => eprintln!("[langedroid] rede: {e}"),
+            }
+        }
         self.child = Some(child);
         self.state = State::Running;
         Ok(())
@@ -709,6 +754,14 @@ fn selftest() -> bool {
 
 #[cfg(test)]
 mod shell_tests {
+    #[test]
+    fn netns_msg() {
+        let m = super::netns_move_msg(2, 77);
+        assert_eq!(m.len(), 40);
+        assert_eq!(u32::from_ne_bytes(m[0..4].try_into().unwrap()), 40);
+        assert_eq!(i32::from_ne_bytes(m[20..24].try_into().unwrap()), 2);
+        assert_eq!(u32::from_ne_bytes(m[36..40].try_into().unwrap()), 77);
+    }
     use super::*;
     #[test]
     fn components() {

@@ -36,7 +36,7 @@ done
 wait $qpid
 grep -aq 'Failed to get "write" lock' build/boot.log && { echo "ERRO: disco em uso por outro processo"; exit 2; }
 fail=0
-for want in "langedroid] open -> ok state=running" "init: init second stage started" "init: starting service 'servicemanager'"; do
+for want in "langedroid] open -> ok state=running" "langedroid] rede: eth0 -> container" "init: init second stage started" "init: starting service 'servicemanager'"; do
   grep -qF "$want" build/boot.log && echo "OK    $want" || { echo "FALTA $want"; fail=1; }
 done
 grep -q "Kernel panic" build/boot.log && { echo "FALHOU: kernel panic"; fail=1; }

@@ -24,10 +24,10 @@ printf 'exec=/bin/heartbeat\nrestart=always\n' > "$S/00-heartbeat.svc"
 printf 'exec=/bin/memhog\nrestart=never\nmemory_max=16M\n' > "$S/50-memhog.svc"
 DISKS=(); CMDLINE_EXTRA=
 QEMU=qemu-system-aarch64
-GPU_DEV=(-device virtio-gpu-device -device virtio-tablet-device)  # 2D: Mesa renderiza por software (llvmpipe/kms_swrast)
+GPU_DEV=(-device virtio-gpu-device -device virtio-tablet-device -netdev user,id=net0 -device virtio-net-device,netdev=net0)  # 2D: Mesa renderiza por software (llvmpipe/kms_swrast)
 if [ "${GPU:-}" = virgl ]; then
   QEMU=/usr/bin/qemu-system-aarch64  # QEMU do Ubuntu tem virglrenderer; o do Homebrew não
-  GPU_DEV=(-device virtio-gpu-gl-device -display egl-headless -device virtio-tablet-device)
+  GPU_DEV=(-device virtio-gpu-gl-device -display egl-headless -device virtio-tablet-device -netdev user,id=net0 -device virtio-net-device,netdev=net0)
 fi
 if [ -n "${ANDROID:-}" ]; then
   A=../android/build
