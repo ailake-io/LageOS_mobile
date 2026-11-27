@@ -11,6 +11,8 @@ Revisão do Blueprint e plano prático. Data: 2026-11-26.
 | libhybris (Fase 2) | Funciona, mas cada aparelho = meses de port. | Começar só com aparelhos de **kernel mainline** (postmarketOS). libhybris depois. |
 | "Tudo do zero" | Compositor, container e HAL do zero = anos. | Reusar: **Smithay** (compositor Wayland em Rust), **Waydroid/LXC** (container Android), **PipeWire**. Diferencial nosso fica no que é novo. |
 | 220 MB no boot (§5A) | Viável, mas só medindo. | Orçamento de RAM medido em CI a cada fase. |
+| SELinux do container (§6.1) | A política SELinux é global no kernel: carregar a sepolicy do Android (necessária p/ `servicemanager`/`apexd`) vale também p/ o host. Hoje: permissivo. | Antes do modo enforcing: política unificada host + container (domínios do LangeOS + sepolicy Android), carregada pelo `lange-init`. |
+| 32-bit (§5) | Núcleos ARMv9 não executam AArch32; zygote32 gasta RAM residente. | Android **64-bit only** por padrão (`langedroid`); `--allow-32bit` + `CONFIG_COMPAT` p/ apps legados. |
 | Freezer "libera a RAM" (§5A) | `cgroup freezer` só para a CPU; a RAM continua ocupada. | Freeze + `memory.reclaim` (páginas vão p/ zram). Implementado no `langedroid`. |
 
 ## 2. Princípios
@@ -29,7 +31,7 @@ Revisão do Blueprint e plano prático. Data: 2026-11-26.
 | 3 | init: shutdown/reboot por sinal, cgroup v2 por serviço, log | `poweroff` limpo no QEMU (`qemu/test-boot.sh`) | ✅ sinais + cgroup v2 (`memory_max`) + log em `/data` |
 | 4 | Rootfs EROFS read-only + ZRAM no boot | boot de EROFS, `zram0` ativo | ✅ `/system` EROFS lz4 ro, `/data` ext4, zram = ½ RAM |
 | 5 | Orquestrador LangeDroid (Rust): namespaces + cgroup freezer, sem Android ainda | congela/descongela container de teste, mede RAM | ✅ `langedroid`; ocioso 9.2 MB → 0.3 MB |
-| 6 | Android real no container (imagem Waydroid/LineageOS) | app Android abre no QEMU | 🔄 init Android 2º estágio roda no container (property service, init.rc); falta servicemanager/zygote |
+| 6 | Android real no container (imagem Waydroid/LineageOS) | app Android abre no QEMU | 🔄 init + sepolicy + service managers + zygote64 OK (10 min sem reboot); falta gráficos (surfaceflinger sem EGL) |
 | 7 | Compositor Smithay + launcher mínima (virtio-gpu) | janela nativa + janela Android na tela | |
 | 8 | Primeiro aparelho físico | boot no hardware | |
 | 9 | Proxy de permissões, firewall eBPF, AVB | — | |

@@ -30,11 +30,12 @@ if [ -n "${ANDROID:-}" ]; then
          -drive file=$A/vendor.img,format=raw,if=none,id=avendor,readonly=on -device virtio-blk-device,drive=avendor
          -drive file=$A/system.img,format=raw,if=none,id=asys,readonly=on -device virtio-blk-device,drive=asys)
   printf '/dev/vdc /android/root ext4 ro\n/dev/vdd /android/root/vendor ext4 ro\n/dev/vde /android/root/data ext4 rw\n' >> "$R/etc/lange/fstab"
-  # 1º estágio do init Android (mknod /dev, fstab, SELinux) é trabalho do host: entra direto no 2º.
-  printf 'exec=/bin/langedroid daemon --rootfs /android/root --idle-freeze %s --payload /system/bin/init second_stage\n' "${IDLE_FREEZE:-30}" > "$S/20-langedroid.svc"
+  # 1º estágio do init Android (mknod /dev, fstab) é trabalho do host: entra no selinux_setup
+  # (carrega a sepolicy do Android, permissiva) que então chama o 2º estágio.
+  printf 'exec=/bin/langedroid daemon --rootfs /android/root --idle-freeze %s %s--payload /system/bin/init selinux_setup\n' "${IDLE_FREEZE:-30}" "${DEBUG_LOGCAT:+--debug-logcat }" > "$S/20-langedroid.svc"
   printf 'exec=/bin/langedroid ctl open\nrestart=never\n' > "$S/30-android-open.svc"
   MEM=${MEM:-3072}
-  CMDLINE_EXTRA="printk.devkmsg=on"  # sem ratelimit: logs do init Android completos
+  CMDLINE_EXTRA="printk.devkmsg=on androidboot.selinux=permissive"  # sem ratelimit: logs do init Android completos
   rm -f "$S"/{00-heartbeat,50-memhog,90-flagship-only}.svc  # sem ruído no log do Android
 else
   printf 'exec=/bin/langedroid daemon --idle-freeze %s\n' "${IDLE_FREEZE:-30}" > "$S/20-langedroid.svc"

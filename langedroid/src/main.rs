@@ -3,6 +3,7 @@
 //!   langedroid daemon [--idle-freeze SEG] [--rootfs DIR] [--payload CMD...]   serviço (root, sob lange-init)
 //!     --rootfs DIR: raiz Android montada (system + vendor + data); payload padrão vira /init
 //!     --allow-32bit: mantém ABIs 32-bit da imagem (padrão: Android só 64-bit, ver abi64_only)
+//!     --debug-logcat: logcat do Android inteiro em /dev/kmsg (console do host). Só p/ depuração.
 //!   langedroid ctl <open|close|freeze|thaw|status|stop>         cliente
 //!   langedroid selftest                                          teste ponta a ponta contra o daemon
 //!
@@ -91,17 +92,28 @@ fn zygote64_only(rc: &str) -> String {
     out
 }
 
+/// Anexa um serviço logcat (stdout -> kmsg via stdio_to_kmsg) a um .rc existente (o init só lê .rc de diretórios read-only).
+/// seclabel su: build userdebug; sem domínio o init recusa o serviço.
+fn add_debug_logcat(rc: &str) -> String {
+    format!("{rc}\n# langedroid --debug-logcat\nservice lange_logcat /system/bin/logcat -b all -v brief\n    user root\n    seclabel u:r:su:s0\n    stdio_to_kmsg\n\non early-init\n    start lange_logcat\n")
+}
+
 /// Arquivos do rootfs a sobrepor (bind) com a política 64-bit. Escreve cópias em /run/langedroid.
-fn prop_overrides(root: &str) -> std::io::Result<Vec<(String, String)>> {
+fn prop_overrides(root: &str, abi64: bool, debug_logcat: bool) -> std::io::Result<Vec<(String, String)>> {
     let dir = "/run/langedroid";
     fs::create_dir_all(dir)?;
     let mut binds = vec![];
-    let files: [(&str, fn(&str) -> String); 4] = [
-        ("system/build.prop", abi64_only),
-        ("vendor/build.prop", abi64_only),
-        ("vendor/odm/etc/build.prop", abi64_only), // odm tem prioridade sobre vendor nas ABIs
-        ("system/etc/init/hw/init.zygote64_32.rc", zygote64_only),
-    ];
+    type Policy = fn(&str) -> String;
+    let mut files: Vec<(&str, Policy)> = vec![];
+    if abi64 {
+        files.extend([
+            ("system/build.prop", abi64_only as Policy),
+            ("vendor/build.prop", abi64_only),
+            ("vendor/odm/etc/build.prop", abi64_only), // odm tem prioridade sobre vendor nas ABIs
+            ("system/etc/init/hw/init.zygote64_32.rc", zygote64_only),
+        ]);
+    }
+    if debug_logcat { files.push(("system/etc/init/bootstat-debug.rc", add_debug_logcat)); }
     for (rel, policy) in files {
         let dst = format!("{root}/{rel}");
         let Ok(text) = fs::read_to_string(&dst) else { continue };
@@ -123,13 +135,22 @@ fn enter_rootfs(root: &str, binds: &[(String, String)]) -> std::io::Result<()> {
         fs::write(&t, "")?;
         mnt(&format!("/dev/{n}"), &t, "", MS_BIND, "")?;
     }
+    // stdio_to_kmsg do init Android escreve em /dev/kmsg_debug (criado pelo 1º estágio, que pulamos)
+    fs::write(format!("{dev}/kmsg_debug"), "")?;
+    mnt("/dev/kmsg", &format!("{dev}/kmsg_debug"), "", MS_BIND, "")?;
     fs::create_dir(format!("{dev}/pts"))?;
     mnt("devpts", &format!("{dev}/pts"), "devpts", MS_NOSUID | MS_NOEXEC, "newinstance,ptmxmode=0666,mode=0620")?;
     symlink("pts/ptmx", format!("{dev}/ptmx"))?;
     // binderfs próprio do container: binder/hwbinder/vndbinder isolados dos do host
     fs::create_dir(format!("{dev}/binderfs"))?;
     mnt("binder", &format!("{dev}/binderfs"), "binder", 0, "")?;
-    for b in ["binder", "hwbinder", "vndbinder"] { symlink(format!("binderfs/{b}"), format!("{dev}/{b}"))?; }
+    // binderfs cria os nós 0600 root; serviços Android rodam como system/app e abortam com EACCES.
+    // No Android o ueventd faria chmod 0666, mas binderfs não gera uevent.
+    use std::os::unix::fs::PermissionsExt;
+    for b in ["binder", "hwbinder", "vndbinder"] {
+        fs::set_permissions(format!("{dev}/binderfs/{b}"), fs::Permissions::from_mode(0o666))?;
+        symlink(format!("binderfs/{b}"), format!("{dev}/{b}"))?;
+    }
     // O que o 1º estágio do init Android faria (pulamos: é trabalho do host)
     fs::create_dir(format!("{dev}/socket"))?;
     mnt("tmpfs", &format!("{root}/mnt"), "tmpfs", MS_NOSUID, "mode=0755")?;
@@ -155,7 +176,7 @@ fn enter_rootfs(root: &str, binds: &[(String, String)]) -> std::io::Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum State { Stopped, Running, Frozen }
 
-struct Container { payload: Vec<String>, rootfs: Option<String>, abi64: bool, child: Option<Child>, state: State, idle_freeze: Duration, close_at: Option<Instant> }
+struct Container { payload: Vec<String>, rootfs: Option<String>, abi64: bool, debug_logcat: bool, child: Option<Child>, state: State, idle_freeze: Duration, close_at: Option<Instant> }
 
 fn cg(file: &str) -> String { format!("{CG}/{file}") }
 
@@ -176,9 +197,9 @@ impl Container {
         fs::create_dir_all(CG).map_err(|e| format!("cgroup: {e}"))?;
         let procs = cg("cgroup.procs");
         let rootfs = self.rootfs.clone();
-        let binds = match (&rootfs, self.abi64) {
-            (Some(r), true) => prop_overrides(r).map_err(|e| format!("build.prop 64-bit: {e}"))?,
-            _ => vec![],
+        let binds = match &rootfs {
+            Some(r) => prop_overrides(r, self.abi64, self.debug_logcat).map_err(|e| format!("overrides: {e}"))?,
+            None => vec![],
         };
         let mut cmd = Command::new(&self.payload[0]);
         cmd.args(&self.payload[1..]);
@@ -281,11 +302,13 @@ fn daemon(args: &[String]) {
     let mut payload = vec![];
     let mut rootfs = None;
     let mut abi64 = true;
+    let mut debug_logcat = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--idle-freeze" => idle = it.next().and_then(|v| v.parse().ok()).expect("--idle-freeze SEG"),
             "--allow-32bit" => abi64 = false,
+            "--debug-logcat" => debug_logcat = true,
             "--rootfs" => rootfs = Some(it.next().expect("--rootfs DIR").clone()),
             "--payload" => { payload = it.by_ref().cloned().collect(); }
             o => { eprintln!("[langedroid] argumento desconhecido: {o}"); std::process::exit(2); }
@@ -303,7 +326,7 @@ fn daemon(args: &[String]) {
         eprintln!("[langedroid] chmod {SOCK}: {e}"); std::process::exit(1);
     }
     l.set_nonblocking(true).unwrap();
-    let mut c = Container { payload, rootfs, abi64, child: None, state: State::Stopped, idle_freeze: Duration::from_secs(idle), close_at: None };
+    let mut c = Container { payload, rootfs, abi64, debug_logcat, child: None, state: State::Stopped, idle_freeze: Duration::from_secs(idle), close_at: None };
     eprintln!("[langedroid] pronto em {SOCK} (cold start sob demanda, freeze após {idle}s ocioso)");
     loop {
         match l.accept() {
@@ -394,7 +417,7 @@ fn main() {
             Err(e) => { eprintln!("langedroid: {SOCK}: {e}"); std::process::exit(1) }
         },
         Some("selftest") => std::process::exit(if selftest() { 0 } else { 1 }),
-        _ => { eprintln!("uso: langedroid daemon [--idle-freeze SEG] [--rootfs DIR] [--allow-32bit] [--payload CMD...] | ctl CMD | selftest"); std::process::exit(2) }
+        _ => { eprintln!("uso: langedroid daemon [--idle-freeze SEG] [--rootfs DIR] [--allow-32bit] [--debug-logcat] [--payload CMD...] | ctl CMD | selftest"); std::process::exit(2) }
     }
 }
 
