@@ -61,19 +61,26 @@ fn blend(src: u32, dst: u32) -> u32 {
 
 /// Desenha `img` em `fb` (largura `fw`, altura `fh`, em pixels) na posição (x,y) com tamanho de
 /// destino (dw,dh): escala vizinho-mais-próximo. ponytail: sem filtro/bilinear; trocar por GPU depois.
+/// Os laços só percorrem a parte visível: tamanho de destino vem do cliente (viewporter) e não
+/// pode virar trabalho ilimitado. Aritmética em i64 (sem overflow de x + dx).
 fn draw(fb: &mut [u32], fw: usize, fh: usize, img: &Image, x: i32, y: i32, dw: usize, dh: usize) {
-    if img.w == 0 || img.h == 0 { return; }
-    for dy in 0..dh {
-        let ty = y + dy as i32;
-        if ty < 0 || ty as usize >= fh { continue; }
-        let sy = dy * img.h / dh;
+    if img.w == 0 || img.h == 0 || dw == 0 || dh == 0 { return; }
+    let span = |pos: i32, len: usize, max: usize| -> (usize, usize) {
+        let (pos, len, max) = (pos as i64, len.min(i64::MAX as usize) as i64, max as i64);
+        let start = (-pos).clamp(0, len);
+        let end = (max - pos).clamp(start, len);
+        (start as usize, end as usize)
+    };
+    let (y0, y1) = span(y, dh, fh);
+    let (x0, x1) = span(x, dw, fw);
+    for dy in y0..y1 {
+        let ty = (y as i64 + dy as i64) as usize;
+        let sy = (dy as u128 * img.h as u128 / dh as u128) as usize;
         let row = &img.px[sy * img.w..(sy + 1) * img.w];
-        let out = &mut fb[ty as usize * fw..(ty as usize + 1) * fw];
-        for dx in 0..dw {
-            let tx = x + dx as i32;
-            if tx < 0 || tx as usize >= fw { continue; }
-            let s = row[dx * img.w / dw];
-            let d = &mut out[tx as usize];
+        let out = &mut fb[ty * fw..(ty + 1) * fw];
+        for dx in x0..x1 {
+            let s = row[(dx as u128 * img.w as u128 / dw as u128) as usize];
+            let d = &mut out[(x as i64 + dx as i64) as usize];
             *d = if img.alpha { blend(s, *d) } else { s };
         }
     }
@@ -388,9 +395,13 @@ fn main() {
     if let Some(dir) = std::path::Path::new(&socket).parent() { let _ = fs::create_dir_all(dir); }
     let _ = fs::remove_file(&socket);
     let listener = ListeningSocket::bind_absolute(socket.clone().into()).expect("bind socket wayland");
-    // clientes do container (uid system) precisam conectar
+    // Só o uid/gid 1000 (system do Android no container; sem user ns os uids coincidem) conecta.
     use std::os::unix::fs::PermissionsExt;
-    let _ = fs::set_permissions(&socket, fs::Permissions::from_mode(0o666));
+    if let Err(e) = std::os::unix::fs::chown(&socket, Some(1000), Some(1000))
+        .and_then(|_| fs::set_permissions(&socket, fs::Permissions::from_mode(0o660))) {
+        eprintln!("[compositor] permissões do socket: {e}");
+        std::process::exit(1);
+    }
     eprintln!("[compositor] pronto em {socket} ({}x{})", screen.w, screen.h);
 
     let start = Instant::now();
@@ -438,6 +449,12 @@ mod tests {
         let mut fb = vec![0u32; 4];
         draw(&mut fb, 2, 2, &img, 1, 1, 2, 1); // recorta fora da tela
         assert_eq!(fb, [0, 0, 0, 0xff_00_00_01]);
+        // destino gigante (cliente malicioso): termina rápido, só toca a área visível
+        let t = std::time::Instant::now();
+        let mut fb = vec![0u32; 4];
+        draw(&mut fb, 2, 2, &img, -1_000_000, i32::MAX - 1, usize::MAX / 2, usize::MAX / 2);
+        draw(&mut fb, 2, 2, &img, i32::MIN, i32::MIN, usize::MAX, usize::MAX);
+        assert!(t.elapsed() < std::time::Duration::from_millis(100));
     }
     #[test]
     fn read_bounds() {

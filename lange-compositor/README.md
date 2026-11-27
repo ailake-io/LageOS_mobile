@@ -12,6 +12,7 @@ lange-compositor [--socket /run/lange/wayland-0] [--size LxA] [--screenshot ARQ.
 - `--screenshot`: PPM a cada 2 s (usado por `android/test-android.sh`).
 
 ## Limites conhecidos (ponytail)
+- Compositor roda como root (precisa ser DRM master). Separar privilégio: só o fd DRM, resto sem root.
 - Sem input (`wl_seat` global não criado). O Seat do Smithay exige libxkbcommon; `build.rs` linka um stub que faz trap se chamado.
 - Polling ~60 Hz, buffer único (sem page flip/vblank), cópia de cada buffer do cliente na CPU.
 - Sem `wl_shell`, popups ignorados.

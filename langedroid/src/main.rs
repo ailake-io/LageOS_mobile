@@ -43,6 +43,9 @@ const CLONE_NEWNET: i32 = 0x4000_0000;
 const MS_REC: usize = 0x4000;
 const MS_PRIVATE: usize = 0x4_0000;
 const MS_BIND: usize = 0x1000;
+const MS_RDONLY: usize = 0x1;
+const MS_NODEV: usize = 0x4;
+const MS_REMOUNT: usize = 0x20;
 const MS_NOSUID: usize = 0x2;
 const MS_NOEXEC: usize = 0x8;
 const MNT_DETACH: i32 = 2;
@@ -202,6 +205,8 @@ fn enter_rootfs(root: &str, binds: &[(String, String)], wayland_dir: Option<&str
         let user = format!("{root}/run/user/1000");
         fs::create_dir_all(&user)?;
         mnt(w, &user, "", MS_BIND, "")?;
+        // read-only: o container conecta no socket (sockets ignoram ro) mas não pode trocá-lo
+        mnt("none", &user, "", MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, "")?;
     }
     mnt("proc", &format!("{root}/proc"), "proc", MS_NOSUID | MS_NOEXEC, "")?;
     mnt("sysfs", &format!("{root}/sys"), "sysfs", MS_NOSUID | MS_NOEXEC, "")?;
