@@ -215,6 +215,7 @@ struct App {
     images: HashMap<ObjectId, Image>,
     dirty: bool,
     size: (i32, i32),
+    commits: u32,
 }
 
 impl BufferHandler for App { fn buffer_destroyed(&mut self, _b: &wl_buffer::WlBuffer) {} }
@@ -229,7 +230,14 @@ impl CompositorHandler for App {
         let assignment = with_states(surface, |s| s.cached_state.get::<SurfaceAttributes>().current().buffer.take());
         match assignment {
             Some(BufferAssignment::NewBuffer(buf)) => {
+                let kind = if get_dmabuf(&buf).is_ok() { "dmabuf" } else { "shm" };
                 let img = match get_dmabuf(&buf) { Ok(d) => import_dmabuf(d), Err(_) => import_shm(&buf) };
+                // ponytail: log só dos primeiros commits (diagnóstico da etapa 7), sem inundar o console
+                if self.commits < 20 {
+                    self.commits += 1;
+                    let pixel = img.as_ref().and_then(|i| i.px.get(i.px.len() / 2).copied());
+                    eprintln!("[compositor] commit {kind} {:?} pixel_central={pixel:08x?}", img.as_ref().map(|i| (i.w, i.h)));
+                }
                 match img {
                     Some(img) => { self.images.insert(surface.id(), img); }
                     None => eprintln!("[compositor] buffer com formato não suportado em {:?}", surface.id()),
@@ -268,11 +276,11 @@ impl DmabufHandler for App {
     fn dmabuf_state(&mut self) -> &mut DmabufState { &mut self.dmabuf }
     fn dmabuf_imported(&mut self, _g: &DmabufGlobal, dmabuf: Dmabuf, notifier: ImportNotifier) {
         // aceita só o que sabemos mapear e ler: 1 plano, formato conhecido
-        if dmabuf.num_planes() == 1 && fourcc_info(dmabuf.format().code).is_some() {
-            let _ = notifier.successful::<App>();
-        } else {
-            notifier.failed();
-        }
+        let f = dmabuf.format();
+        let ok = dmabuf.num_planes() == 1 && fourcc_info(f.code).is_some();
+        eprintln!("[compositor] dmabuf {:?} modifier={:?} planos={} {}x{} -> {}", f.code, f.modifier,
+            dmabuf.num_planes(), dmabuf.size().w, dmabuf.size().h, if ok { "aceito" } else { "RECUSADO" });
+        if ok { let _ = notifier.successful::<App>(); } else { notifier.failed(); }
     }
 }
 
@@ -389,6 +397,7 @@ fn main() {
         images: HashMap::new(),
         dirty: true,
         size: (screen.w as i32, screen.h as i32),
+        commits: 0,
     };
     let _ = &app.output;
 

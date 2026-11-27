@@ -20,8 +20,8 @@ debugfs -R "dump /screen.ppm build/screen.ppm" ../qemu/build/data.img 2>/dev/nul
 [ -s build/screen.ppm ] && python3 ppm2png.py build/screen.ppm build/screen.png && echo "screenshot: android/build/screen.png"
 # progresso (informativo)
 echo "surfaceflinger iniciado: $(grep -ac "starting service 'surfaceflinger'" build/boot.log)x" \
-     "| system_server: $(grep -aqE 'Entered the Android system server' build/boot.log && echo sim || echo não)" \
+     "| system_server: $(grep -aqE 'Entered the Android system server|SystemServer: Entered' build/boot.log && echo sim || echo não)" \
      "| compositor clientes: $(grep -ac 'compositor\] cliente conectado' build/boot.log)" \
-     "| boot completo: $(grep -aqE 'sys.boot_completed|Boot is finished|BOOT_COMPLETED' build/boot.log && echo sim || echo não)"
+     "| boot completo: $(grep -aqE 'processing action \(sys.boot_completed=1\)' build/boot.log && echo sim || echo não)"
 [ $fail -eq 0 ] && echo PASSOU || { echo "--- últimas linhas init/langedroid ---"; grep -E 'init:|langedroid|\[init\]' build/boot.log | tail -25; }
 exit $fail
