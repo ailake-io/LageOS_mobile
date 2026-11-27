@@ -163,13 +163,15 @@ pub struct Shell {
     pub volume: u8,
     /// rede do Android: None = desconhecido, Some(iface vazio) = sem rede
     pub net: Option<String>,
+    /// ícones reais renderizados pelo Android (ARGB, ICON x ICON) por componente
+    pub icons: std::collections::HashMap<String, Vec<u32>>,
 }
 
 pub const VOL_MAX: u8 = 15;
 
 impl Shell {
     pub fn new() -> Shell {
-        Shell { mode: Mode::Locked, apps: vec![], recents: vec![], font: Font::new(), down: None, page: 0, panel: false, notifs: vec![], brightness: 100, volume: 8, net: None }
+        Shell { mode: Mode::Locked, apps: vec![], recents: vec![], font: Font::new(), down: None, page: 0, panel: false, notifs: vec![], brightness: 100, volume: 8, net: None, icons: Default::default() }
     }
 
     /// Shell recebe o toque (e não a janela Android)?
@@ -295,6 +297,14 @@ impl Shell {
 
     /// Ícone: círculo colorido com a inicial.
     fn icon(&mut self, c: &mut Canvas, cx: i32, y: i32, size: i32, app: &AppEntry) {
+        if let Some(px) = self.icons.get(&app.component).filter(|p| !p.is_empty()) {
+            let (x0, y0) = (cx - ICON / 2, y + (size - ICON) / 2);
+            for (i, &p) in px.iter().enumerate() {
+                let a = p >> 24;
+                if a > 0 { c.blend_px(x0 + i as i32 % ICON, y0 + i as i32 / ICON, p, a); }
+            }
+            return;
+        }
         c.rounded(cx - size / 2, y, size, size, size / 2, app.color);
         let letter: String = app.label.chars().take(1).collect();
         let px = (size * 9 / 20) as u32;
@@ -452,6 +462,24 @@ pub fn parse_notifs(reply: &str) -> Option<Vec<(String, String)>> {
         .map(|e| { let (t, x) = e.split_once('\x1f').unwrap_or((e, "")); (t.to_string(), x.to_string()) }).collect())
 }
 
+/// Pedido de ícones dos apps que ainda não têm (None se todos têm).
+pub fn icons_request(s: &Shell) -> Option<String> {
+    let missing: Vec<&str> = s.apps.iter().map(|a| a.component.as_str()).filter(|c| !s.icons.contains_key(*c)).collect();
+    (!missing.is_empty()).then(|| format!("icons {ICON} {}", missing.join(" ")))
+}
+
+/// "icons" -> [(componente, ARGB)]: resposta "ok comp TAM hex\x1ecomp TAM hex". Só aceita TAM = ICON.
+pub fn parse_icons(reply: &str) -> Vec<(String, Vec<u32>)> {
+    let Some(body) = reply.strip_prefix("ok") else { return vec![] };
+    body.split('\x1e').filter_map(|e| {
+        let mut it = e.split_whitespace();
+        let (comp, n, hex) = (it.next()?, it.next()?.parse::<i32>().ok()?, it.next()?);
+        if n != ICON || hex.len() != (n * n * 8) as usize { return None; }
+        let px = (0..hex.len()).step_by(8).map(|i| u32::from_str_radix(&hex[i..i + 8], 16)).collect::<Result<_, _>>().ok()?;
+        Some((comp.to_string(), px))
+    }).collect()
+}
+
 /// Nível da bateria (%) em /sys/class/power_supply/*/capacity; None sem bateria (QEMU, desktop).
 pub fn battery() -> Option<u8> {
     std::fs::read_dir("/sys/class/power_supply").ok()?.flatten()
@@ -537,6 +565,19 @@ mod tests {
         s.touch_down(600.0, 600.0);
         assert_eq!(s.touch_up(600.0, 300.0, w, h), Action::Redraw);
         assert_eq!(s.mode, Mode::Home);
+    }
+
+    #[test]
+    fn icons() {
+        let hex = "ff00ff00".repeat((ICON * ICON) as usize);
+        let got = parse_icons(&format!("ok a.b/.C {ICON} {hex}\x1ebad 2 00"));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "a.b/.C");
+        assert_eq!(got[0].1[0], 0xff00ff00);
+        let mut s = Shell::new();
+        s.apps = vec![AppEntry::new("a.b/.C"), AppEntry::new("d.e/.F")];
+        s.icons.extend(got);
+        assert_eq!(icons_request(&s).unwrap(), format!("icons {ICON} d.e/.F"));
     }
 
     #[test]

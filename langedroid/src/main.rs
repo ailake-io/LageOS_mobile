@@ -23,6 +23,10 @@ const SOCK: &str = "/run/langedroid.sock";
 const SHELL_SOCK: &str = "/run/langedroid-shell.sock";
 /// uid do lange-compositor (ver COMPOSITOR_UID lá)
 const SHELL_UID: u32 = 600;
+/// helper Java (android/icons) que renderiza os ícones dos apps dentro do container
+const ICONS_JAR: &str = "/usr/share/lange/lange-icons.jar";
+/// cópia do jar dentro do container (dir só do root, ver `icons`)
+const ICONS_JAR_IN_ANDROID: &str = "/data/lange-host/lange-icons.jar";
 const CG: &str = "/sys/fs/cgroup/android";
 
 unsafe extern "C" {
@@ -67,6 +71,10 @@ const MNT_DETACH: i32 = 2;
 const SYS_PIVOT_ROOT: i64 = 41;
 #[cfg(target_arch = "x86_64")]
 const SYS_PIVOT_ROOT: i64 = 155;
+#[cfg(target_arch = "aarch64")]
+const O_NOFOLLOW: i32 = 0o100000;
+#[cfg(target_arch = "x86_64")]
+const O_NOFOLLOW: i32 = 0o400000;
 
 fn cstr(s: &str) -> std::ffi::CString { std::ffi::CString::new(s).unwrap() }
 
@@ -465,8 +473,16 @@ impl Container {
         use std::os::unix::process::CommandExt;
         let (fds, rootfd): (Vec<i32>, i32) = (ns.iter().map(|f| f.as_raw_fd()).collect(), root.as_raw_fd());
         let mut cmd = Command::new(prog);
-        cmd.args(args).env_clear().env("PATH", "/system/bin").stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+        // ambiente de um filho do init (BOOTCLASSPATH, ANDROID_ROOT...: app_process precisa). O init
+        // exporta essas variáveis só p/ os serviços; o environ dele mesmo não as tem.
+        let kids = fs::read_to_string(format!("/proc/{init}/task/{init}/children")).unwrap_or_default();
+        let env = kids.split_whitespace().filter_map(|p| fs::read(format!("/proc/{p}/environ")).ok())
+            .find(|e| e.windows(14).any(|w| w == b"BOOTCLASSPATH="))
+            .unwrap_or_else(|| fs::read(format!("/proc/{init}/environ")).unwrap_or_default());
+        cmd.env_clear().envs(env.split(|&b| b == 0).filter_map(|kv| std::str::from_utf8(kv).ok()?.split_once('=')));
+        if prog.contains("app_process") { cmd.env("CLASSPATH", ICONS_JAR_IN_ANDROID); }
+        cmd.args(args).env("PATH", "/system/bin").stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped()).stderr(if prog.contains("app_process") { std::process::Stdio::inherit() } else { std::process::Stdio::null() }); // erro de VM/classe do helper de ícones vai p/ o console
         unsafe {
             cmd.pre_exec(move || {
                 // grupo próprio: o watchdog mata intermediário + neto juntos (neto segura os pipes)
@@ -539,6 +555,30 @@ impl Container {
     }
 
     /// Comandos do shell (compositor). Resposta: "ok ..." ou "erro ...".
+    fn icons(&self, arg: &str) -> Result<String, String> {
+        let init = self.android_init().ok_or("sem init do container")?;
+        // roda como root: o jar fica em dir só do root (não em /data/local/tmp, gravável pelo uid shell).
+        // Sem seguir symlink: dir conferido com lstat (dono 0, modo 0755) e arquivo recriado com create_new.
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+        let dir = format!("/proc/{init}/root/data/lange-host");
+        let _ = fs::DirBuilder::new().mode(0o755).create(&dir);
+        let m = fs::symlink_metadata(&dir).map_err(|e| format!("{dir}: {e}"))?;
+        if !m.is_dir() || m.uid() != 0 || m.mode() & 0o022 != 0 { return Err(format!("{dir}: dono/modo inseguro")); }
+        let jar = format!("{dir}/lange-icons.jar");
+        let _ = fs::remove_file(&jar);
+        let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o644).custom_flags(O_NOFOLLOW).open(&jar)
+            .map_err(|e| format!("{jar}: {e}"))?;
+        std::io::copy(&mut fs::File::open(ICONS_JAR).map_err(|e| format!("{ICONS_JAR}: {e}"))?, &mut f).map_err(|e| e.to_string())?;
+        let mut a = vec!["/system/bin", "LangeIcons"];
+        a.extend(arg.split(' '));
+        let out = self.android_run("/system/bin/app_process64", &a)?;
+        // linhas "! ..." = erro do helper (sem dado privado: só componente e exceção)
+        // saída sem linha de ícone (ex.: erro da VM) também vai p/ o log
+        if !out.contains(' ') { eprintln!("[langedroid] icons: saída vazia ou inválida ({} bytes)", out.len()); }
+        for e in out.lines().filter(|l| l.starts_with('!')) { eprintln!("[langedroid] icons{}", &e[1..e.len().min(1200)]); }
+        Ok(out.lines().filter(|l| !l.starts_with('!')).collect::<Vec<_>>().join("\x1e"))
+    }
+
     fn handle_shell(&mut self, line: &str) -> String {
         let (verb, arg) = line.split_once(' ').unwrap_or((line, ""));
         let r = match verb {
@@ -555,6 +595,10 @@ impl Container {
                 .map(|t| if has_ipv4(&t) { "on".into() } else { String::new() }),
             "volume" if arg.parse::<u8>().is_ok_and(|v| v <= 15) =>
                 self.android_cmd(&["media_session", "volume", "--stream", "3", "--set", arg]).map(|_| String::new()),
+            // ícones reais: o Android renderiza (vetor/adaptativo) via app_process; arg = "TAM comp1 comp2 ..."
+            "icons" if arg.split(' ').skip(1).all(valid_component) && arg.split(' ').next().and_then(|n| n.parse::<u16>().ok()).is_some_and(|n| (16..=256).contains(&n)) => {
+                self.icons(arg)
+            }
             "launch" if valid_component(arg) => self.android_cmd(&["activity", "start-activity", "-n", arg]).map(|_| String::new()),
             "key" => match arg {
                 // Voltar na 1ª tela do app leva p/ a launcher do Android: avisa o shell ("home") p/ ele
@@ -700,10 +744,12 @@ fn serve_one(l: &UnixListener, allowed: u32, f: &mut dyn FnMut(&str) -> String) 
     if BufReader::new(&s).read_line(&mut line).is_ok() && !line.trim().is_empty() {
         let reply = f(line.trim());
         // conteúdo de notificação é privado: no log (persistente em /data/log) só a contagem
-        let shown = if line.trim() == "notifs" && reply.starts_with("ok") {
+        let verb = line.split_whitespace().next().unwrap_or("");
+        let shown = if (verb == "notifs" || verb == "icons") && reply.starts_with("ok") {
             format!("ok ({})", reply.split('\x1e').filter(|e| !e.trim_start_matches("ok").trim().is_empty()).count())
         } else { reply.chars().take(200).collect() };
-        eprintln!("[langedroid] {} -> {shown}", line.trim());
+        // pedido de ícones lista todos os apps: no log só o verbo
+        eprintln!("[langedroid] {} -> {shown}", if verb == "icons" { verb } else { line.trim() });
         let _ = writeln!(&s, "{reply}");
     }
     true

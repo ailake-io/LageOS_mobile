@@ -1,0 +1,10 @@
+package android.os; public class Looper { public static void prepareMainLooper() {} }
+package android.content; public abstract class Context { public abstract android.content.pm.PackageManager getPackageManager(); }
+package android.content; public class ComponentName { public static ComponentName unflattenFromString(String s) { return null; } }
+package android.content.pm; public abstract class PackageManager { public static class NameNotFoundException extends Exception {} public abstract android.graphics.drawable.Drawable getActivityIcon(android.content.ComponentName c) throws NameNotFoundException; public abstract ActivityInfo getActivityInfo(android.content.ComponentName c, int f) throws NameNotFoundException; public abstract android.content.res.Resources getResourcesForApplication(ApplicationInfo a) throws NameNotFoundException; }
+package android.graphics.drawable; public abstract class Drawable { public void setBounds(int l, int t, int r, int b) {} public abstract void draw(android.graphics.Canvas c); }
+package android.graphics; public class Canvas { public Canvas(Bitmap b) {} }
+package android.graphics; public class Bitmap { public enum Config { ARGB_8888 } public static Bitmap createBitmap(int w, int h, Config c) { return null; } public void getPixels(int[] p, int off, int stride, int x, int y, int w, int h) {} }
+package android.content.pm; public class ApplicationInfo {}
+package android.content.pm; public class ActivityInfo { public ApplicationInfo applicationInfo; public final int getIconResource() { return 0; } public final int getThemeResource() { return 0; } }
+package android.content.res; public class Resources { public class Theme { public void applyStyle(int id, boolean force) {} } public Theme newTheme() { return null; } public android.graphics.drawable.Drawable getDrawableForDensity(int id, int density, Theme t) { return null; } }

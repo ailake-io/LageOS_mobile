@@ -38,6 +38,8 @@ if [ -n "${ANDROID:-}" ]; then
          -drive file=$A/vendor.img,format=raw,if=none,id=avendor,readonly=on -device virtio-blk-device,drive=avendor
          -drive file=$A/system.img,format=raw,if=none,id=asys,readonly=on -device virtio-blk-device,drive=asys
          "${GPU_DEV[@]}")
+  # ícones dos apps: helper Java renderizado pelo Android (langedroid `icons`)
+  ../android/icons/build.sh && mkdir -p "$R/usr/share/lange" && cp ../android/icons/build/lange-icons.jar "$R/usr/share/lange/"
   printf '/dev/vdc /android/root ext4 ro\n/dev/vdd /android/root/vendor ext4 ro\n/dev/vde /android/root/data ext4 rw\n' >> "$R/etc/lange/fstab"
   # 1º estágio do init Android (mknod /dev, fstab) é trabalho do host: entra no selinux_setup
   # (carrega a sepolicy do Android, permissiva) que então chama o 2º estágio.

@@ -764,6 +764,7 @@ fn main() {
     let (req_tx, resp_rx) = shell_client();
     // lista de apps: pede até o Android responder (boot leva minutos no QEMU)
     let (mut apps_asked, mut apps_pending) = (Instant::now() - Duration::from_secs(60), false);
+    let (mut icons_asked, mut icons_pending) = (Instant::now() - Duration::from_secs(60), false);
     // diagnóstico do toque (android/test-android.sh): quadro antes do 1º toque e ~4 s após soltar
     let (mut pre_touch_saved, mut post_touch_at) = (false, None::<Instant>);
     // estatística a cada 10 s: commits recebidos, quadros desenhados, tempo médio de render
@@ -807,6 +808,11 @@ fn main() {
             apps_pending = req_tx.send("apps".into()).is_ok();
             let _ = req_tx.send("net".into());
         }
+        // ícones reais: um pedido por vez, no máximo a cada 30 s (erro = tenta de novo)
+        if !icons_pending && icons_asked.elapsed() >= Duration::from_secs(30) && let Some(r) = (!apps_pending).then(|| shell::icons_request(&app.shell)).flatten() {
+            icons_asked = Instant::now();
+            icons_pending = req_tx.send(r).is_ok();
+        }
         for r in app.requests.drain(..) { let _ = req_tx.send(r); }
         while let Ok((req, reply)) = resp_rx.try_recv() {
             if req == "apps" {
@@ -824,6 +830,14 @@ fn main() {
                     Some(_) => {}
                     None => eprintln!("[compositor] apps: {}", reply.chars().take(120).collect::<String>()),
                 }
+            } else if req.starts_with("icons ") {
+                icons_pending = false;
+                let got = shell::parse_icons(&reply);
+                eprintln!("[compositor] {} ícones do Android", got.len());
+                // app sem ícone na resposta fica vazio (= ícone de letra) p/ não pedir de novo
+                if reply.starts_with("ok") { for c in req.split(' ').skip(2) { app.shell.icons.entry(c.to_string()).or_default(); } }
+                for (c, px) in got { app.shell.icons.insert(c, px); }
+                app.dirty = true;
             } else if req == "net" {
                 let net = reply.strip_prefix("ok").map(|i| i.trim().to_string());
                 if net.is_some() && net != app.shell.net { app.shell.net = net; app.dirty = true; }

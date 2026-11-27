@@ -70,6 +70,7 @@ n=min(len(a),len(b))//3; print(sum(1 for i in range(0,n*3,3) if a[i:i+3]!=b[i:i+
   python3 ppm2png.py build/touch-post.ppm build/touch-post.png 2>/dev/null
   grep -aq 'teclado virtual sempre visível' build/boot.log && echo "OK    teclado virtual do Android habilitado" || { echo "FALTA teclado virtual habilitado"; fail=1; }
   grep -aq 'langedroid\] notifs -> ok' build/boot.log && echo "OK    painel rápido leu as notificações do Android" || { echo "FALTA painel rápido ler notificações"; fail=1; }
+  grep -aqE 'compositor\] [1-9][0-9]* ícones do Android' build/boot.log && echo "OK    ícones reais dos apps ($(grep -aoE '[0-9]+ ícones do Android' build/boot.log | tail -1))" || { echo "FALTA ícones reais dos apps"; fail=1; }
   grep -aq 'langedroid\] volume 15 -> ok' build/boot.log && echo "OK    volume do painel chega ao Android" || { echo "FALTA volume do painel"; fail=1; }
   grep -aq 'langedroid\] net -> ok on' build/boot.log && echo "OK    barra de status vê a rede do Android" || { echo "FALTA indicador de rede"; fail=1; }
   grep -aq 'key back -> ok home' build/boot.log && echo "OK    voltar no app volta à tela inicial nativa" || { echo "FALTA voltar no app voltar à tela inicial nativa"; fail=1; }
