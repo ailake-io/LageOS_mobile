@@ -49,6 +49,9 @@ if [ -n "${ANDROID:-}" ]; then
   # sem ponte de sensores ainda (HAL Rust, §4B): HAL do Waydroid registra stubs em vez de sair.
   # Sem isso SensorService espera p/ sempre e o Watchdog mata o system_server.
   GFX_PROPS+='--prop waydroid.stub_sensors_hal=1 '
+  # hwcomposer do Waydroid só desenha o que o host declara ativo ('waydroid show-full-ui' faz isso).
+  # Interface Android inteira numa janela; depois: launcher do LangeOS controla (apps em janelas próprias).
+  GFX_PROPS+='--prop waydroid.active_apps=Waydroid '
   # QEMU emulado (TCG) é ~10-20x mais lento: Watchdog matava o system_server (Blocked in handler).
   # Prop feita p/ emuladores (Cuttlefish); só no QEMU, aparelho real mantém os timeouts normais.
   GFX_PROPS+='--prop ro.hw_timeout_multiplier=10 '
