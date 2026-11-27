@@ -12,7 +12,7 @@ const FG: u32 = 0xffe8_eef4;
 const FG_DIM: u32 = 0xff9a_a8b4;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Mode { Home, App, Recents }
+pub enum Mode { Locked, Home, App, Recents }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppEntry { pub component: String, pub label: String, pub color: u32 }
@@ -25,7 +25,7 @@ impl AppEntry {
 
 /// O que o compositor deve fazer depois de um toque no shell.
 #[derive(Debug, PartialEq)]
-pub enum Action { None, Redraw, Launch(String), Key(&'static str) }
+pub enum Action { None, Redraw, Launch(String), Key(&'static str), Notifs }
 
 /// Nome curto a partir do pacote: com.android.gallery3d -> "Gallery". ponytail: sem o rótulo real do
 /// APK (precisaria ler resources.arsc); trocar quando o langedroid devolver o label.
@@ -146,22 +146,47 @@ const CELL_W: i32 = 128;
 const CELL_H: i32 = 124;
 const ICON: i32 = 64;
 
-pub struct Shell { pub mode: Mode, pub apps: Vec<AppEntry>, pub recents: Vec<String>, pub font: Font, down: Option<(f64, f64)> }
+pub struct Shell {
+    pub mode: Mode, pub apps: Vec<AppEntry>, pub recents: Vec<String>, pub font: Font, down: Option<(f64, f64)>,
+    /// página da grade da tela inicial
+    pub page: usize,
+    /// painel rápido (puxado da barra de status) aberto por cima de qualquer modo
+    pub panel: bool,
+    /// notificações do Android: (título, texto)
+    pub notifs: Vec<(String, String)>,
+}
 
 impl Shell {
-    pub fn new() -> Shell { Shell { mode: Mode::Home, apps: vec![], recents: vec![], font: Font::new(), down: None } }
+    pub fn new() -> Shell {
+        Shell { mode: Mode::Locked, apps: vec![], recents: vec![], font: Font::new(), down: None, page: 0, panel: false, notifs: vec![] }
+    }
+
+    /// Shell recebe o toque (e não a janela Android)?
+    pub fn wants_touch(&self) -> bool { self.mode != Mode::App || self.panel }
+
+    /// Células por página e nº de páginas da grade.
+    fn per_page(w: usize, h: usize) -> (i32, i32) {
+        let (top, bottom) = Self::content(h);
+        let cols = ((w as i32 - 32) / CELL_W).max(1);
+        let rows = ((bottom - top - 24 - 40) / CELL_H).max(1); // 40 = pontos de página
+        (cols, rows)
+    }
+    pub fn pages(&self, w: usize, h: usize) -> usize {
+        let (c, r) = Self::per_page(w, h);
+        self.apps.len().div_ceil((c * r) as usize).max(1)
+    }
 
     /// Área do conteúdo (entre as barras).
     fn content(h: usize) -> (i32, i32) { (BAR as i32, h as i32 - NAV as i32) }
 
-    /// Retângulos (x, y, w, h) das células da grade, na ordem de `apps`.
-    pub fn grid(&self, w: usize, h: usize) -> Vec<(i32, i32, i32, i32)> {
-        let (top, bottom) = Self::content(h);
-        let cols = ((w as i32 - 32) / CELL_W).max(1);
+    /// Células da página atual: (índice em `apps`, retângulo x, y, w, h).
+    pub fn grid(&self, w: usize, h: usize) -> Vec<(usize, (i32, i32, i32, i32))> {
+        let (top, _) = Self::content(h);
+        let (cols, rows) = Self::per_page(w, h);
         let x0 = (w as i32 - cols * CELL_W) / 2;
-        (0..self.apps.len() as i32)
-            .map(|i| (x0 + i % cols * CELL_W, top + 24 + i / cols * CELL_H, CELL_W, CELL_H))
-            .take_while(|&(_, y, _, ch)| y + ch <= bottom) // ponytail: uma página só; paginação quando tiver muitos apps
+        let n = (cols * rows) as usize;
+        (self.page * n..((self.page + 1) * n).min(self.apps.len()))
+            .map(|i| { let k = (i % n) as i32; (i, (x0 + k % cols * CELL_W, top + 24 + k / cols * CELL_H, CELL_W, CELL_H)) })
             .collect()
     }
 
@@ -182,12 +207,33 @@ impl Shell {
     /// Toque começou no shell (fora da janela Android).
     pub fn touch_down(&mut self, x: f64, y: f64) { self.down = Some((x, y)); }
 
-    /// Toque terminou: vira toque simples se não andou muito. Devolve a ação.
+    /// Toque terminou: gesto (arrasto) ou toque simples. Devolve a ação.
     pub fn touch_up(&mut self, x: f64, y: f64, w: usize, h: usize) -> Action {
-        let Some((dx, dy)) = self.down.take() else { return Action::None };
-        if (dx - x).abs() > 24.0 || (dy - y).abs() > 24.0 { return Action::None; } // arrasto: ignora (sem gestos ainda)
+        let Some((sx, sy)) = self.down.take() else { return Action::None };
+        let (dx, dy) = (x - sx, y - sy);
+        let swipe = dx.abs() > 60.0 || dy.abs() > 60.0;
+        if self.panel {
+            // painel: arrastar p/ cima ou tocar fora fecha
+            if (swipe && dy < 0.0) || (!swipe && y as i32 > Self::panel_bottom(h)) { self.panel = false; return Action::Redraw; }
+            return Action::None;
+        }
+        if sy < BAR as f64 && dy > 60.0 && self.mode != Mode::Locked { self.panel = true; return Action::Notifs; }
+        if self.mode == Mode::Locked {
+            if swipe && dy < -80.0 { self.mode = Mode::Home; return Action::Redraw; }
+            return Action::None;
+        }
+        if self.mode == Mode::Home && swipe && dx.abs() > dy.abs() {
+            let last = self.pages(w, h) - 1;
+            let page = if dx < 0.0 { (self.page + 1).min(last) } else { self.page.saturating_sub(1) };
+            if page == self.page { return Action::None; }
+            self.page = page;
+            return Action::Redraw;
+        }
+        if swipe { return Action::None; }
         self.tap(x as i32, y as i32, w, h)
     }
+
+    fn panel_bottom(h: usize) -> i32 { (h as i32 * 3 / 5).max(BAR as i32 + 200) }
 
     pub fn tap(&mut self, x: i32, y: i32, w: usize, h: usize) -> Action {
         let inside = |(rx, ry, rw, rh): (i32, i32, i32, i32)| x >= rx && y >= ry && x < rx + rw && y < ry + rh;
@@ -207,9 +253,9 @@ impl Shell {
         }
         if y < BAR as i32 { return Action::None; }
         let target = match self.mode {
-            Mode::Home => self.grid(w, h).into_iter().position(inside).map(|i| self.apps[i].component.clone()),
+            Mode::Home => self.grid(w, h).into_iter().find(|&(_, r)| inside(r)).map(|(i, _)| self.apps[i].component.clone()),
             Mode::Recents => self.cards(w, h).into_iter().position(inside).map(|i| self.recents[i].clone()),
-            Mode::App => None,
+            Mode::App | Mode::Locked => None,
         };
         match target {
             Some(c) => { self.open(&c); Action::Launch(c) }
@@ -241,6 +287,18 @@ impl Shell {
         let (top, bottom) = Self::content(h);
         match self.mode {
             Mode::App => {}
+            Mode::Locked => {
+                c.gradient(top as usize, bottom as usize, 0xff0b_1a2e, 0xff1d_3b4f);
+                let cy = (top + bottom) / 2;
+                let tw = self.font.width(clock, 110);
+                self.font.draw(c, (w as i32 - tw) / 2, cy - 10, 110, FG, clock);
+                let d = date_now();
+                let dw = self.font.width(&d, 22);
+                self.font.draw(c, (w as i32 - dw) / 2, cy + 36, 22, FG_DIM, &d);
+                let msg = "Deslize para cima para desbloquear";
+                let mw = self.font.width(msg, 16);
+                self.font.draw(c, (w as i32 - mw) / 2, bottom - 24, 16, FG_DIM, msg);
+            }
             Mode::Home => {
                 c.gradient(top as usize, bottom as usize, 0xff10_2a43, 0xff0b_3d3a);
                 if self.apps.is_empty() {
@@ -248,8 +306,15 @@ impl Shell {
                     let tw = self.font.width(msg, 20);
                     self.font.draw(c, (w as i32 - tw) / 2, (top + bottom) / 2, 20, FG_DIM, msg);
                 }
+                let pages = self.pages(w, h);
+                if pages > 1 {
+                    for p in 0..pages as i32 {
+                        let x = w as i32 / 2 + (p * 2 - pages as i32 + 1) * 10 - 4;
+                        c.rounded(x, bottom - 24, 8, 8, 4, if p as usize == self.page { FG } else { 0xff4a_5866 });
+                    }
+                }
                 let cells = self.grid(w, h);
-                for (i, (x, y, cw, _)) in cells.into_iter().enumerate() {
+                for (i, (x, y, cw, _)) in cells.into_iter() {
                     let app = self.apps[i].clone();
                     self.icon(c, x + cw / 2, y + 8, ICON, &app);
                     let label = self.font.fit(&app.label, 15, cw - 12);
@@ -275,6 +340,7 @@ impl Shell {
                 }
             }
         }
+        if self.panel { self.draw_panel(c, clock, battery); }
         // barra de status: nome à esquerda, bateria + relógio à direita
         c.rect(0, 0, w as i32, BAR as i32, BG_BAR);
         self.font.draw(c, 12, 22, 15, FG_DIM, "LangeOS");
@@ -291,6 +357,68 @@ impl Shell {
         c.rounded(r - 9, cy - 9, 18, 18, 3, FG);
         c.rounded(r - 6, cy - 6, 12, 12, 2, BG_BAR);
     }
+}
+
+impl Shell {
+    /// Painel rápido: data/hora, bateria e notificações do Android.
+    fn draw_panel(&mut self, c: &mut Canvas, clock: &str, battery: Option<u8>) {
+        let w = c.w as i32;
+        let bottom = Self::panel_bottom(c.h);
+        c.rect(0, BAR as i32, w, bottom - BAR as i32, 0xf015_1b24 | 0xff00_0000);
+        c.rect(0, bottom - 2, w, 2, 0xff2f_3a48);
+        let mut y = BAR as i32 + 52;
+        self.font.draw(c, 24, y, 40, FG, clock);
+        let d = date_now();
+        let cw = self.font.width(clock, 40);
+        self.font.draw(c, 24 + cw + 16, y, 18, FG_DIM, &d);
+        if let Some(b) = battery {
+            let t = format!("Bateria {b}%");
+            let tw = self.font.width(&t, 18);
+            self.font.draw(c, w - tw - 24, y, 18, FG_DIM, &t);
+        }
+        y += 28;
+        if self.notifs.is_empty() {
+            self.font.draw(c, 24, y + 24, 17, FG_DIM, "Sem notificações");
+        }
+        for (title, text) in self.notifs.clone() {
+            if y + 64 > bottom - 8 { break; }
+            c.rounded(16, y, w - 32, 56, 12, 0xff24_2d3a);
+            let t = self.font.fit(&title, 16, w - 64);
+            self.font.draw(c, 32, y + 23, 16, FG, &t);
+            let tx = self.font.fit(&text, 14, w - 64);
+            self.font.draw(c, 32, y + 45, 14, FG_DIM, &tx);
+            y += 64;
+        }
+    }
+}
+
+/// "sex, 27 nov 2026" (UTC). ponytail: sem fuso, igual ao relógio.
+pub fn date_now() -> String {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    format_date(secs / 86400)
+}
+
+fn format_date(days: u64) -> String {
+    // dias desde 1970-01-01 -> data civil (algoritmo de Howard Hinnant)
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + (m <= 2) as i64;
+    const WD: [&str; 7] = ["qui", "sex", "sáb", "dom", "seg", "ter", "qua"]; // 1970-01-01 = quinta
+    const MO: [&str; 12] = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"];
+    format!("{}, {d} {} {y}", WD[(days % 7) as usize], MO[(m - 1) as usize])
+}
+
+/// "notifs" -> [(título, texto)]: resposta "ok t1\x1fx1\x1et2\x1fx2".
+pub fn parse_notifs(reply: &str) -> Option<Vec<(String, String)>> {
+    let body = reply.strip_prefix("ok")?.trim_start();
+    Some(body.split('\x1e').filter(|e| !e.is_empty())
+        .map(|e| { let (t, x) = e.split_once('\x1f').unwrap_or((e, "")); (t.to_string(), x.to_string()) }).collect())
 }
 
 /// Nível da bateria (%) em /sys/class/power_supply/*/capacity; None sem bateria (QEMU, desktop).
@@ -328,9 +456,11 @@ mod tests {
     #[test]
     fn taps() {
         let (w, h) = (1280, 800);
-        let mut s = Shell { mode: Mode::Home, apps: vec![AppEntry::new("a.b/.C"), AppEntry::new("d.e/.F")], recents: vec![], font: Font::new(), down: None };
+        let mut s = Shell::new();
+        s.mode = Mode::Home;
+        s.apps = vec![AppEntry::new("a.b/.C"), AppEntry::new("d.e/.F")];
         let cells = s.grid(w, h);
-        let (x, y, cw, ch) = cells[1];
+        let (_, (x, y, cw, ch)) = cells[1];
         assert_eq!(s.tap(x + cw / 2, y + ch / 2, w, h), Action::Launch("d.e/.F".into()));
         assert_eq!(s.mode, Mode::App);
         assert_eq!(s.recents, ["d.e/.F"]);
@@ -346,7 +476,36 @@ mod tests {
         // arrasto não é toque
         s.mode = Mode::Home;
         s.touch_down(10.0, 100.0);
-        assert_eq!(s.touch_up(300.0, 100.0, w, h), Action::None);
+        assert_eq!(s.touch_up(300.0, 100.0, w, h), Action::None); // 1 página: arrasto não muda nada
+        // páginas
+        s.apps = (0..60).map(|i| AppEntry::new(&format!("p{i}.x/.M"))).collect();
+        assert!(s.pages(w, h) >= 2);
+        s.touch_down(900.0, 300.0);
+        assert_eq!(s.touch_up(600.0, 310.0, w, h), Action::Redraw);
+        assert_eq!(s.page, 1);
+        assert!(s.grid(w, h)[0].0 > 0);
+        // painel: puxar da barra de status abre; arrastar p/ cima fecha
+        s.touch_down(600.0, 10.0);
+        assert_eq!(s.touch_up(600.0, 300.0, w, h), Action::Notifs);
+        assert!(s.panel && s.wants_touch());
+        s.touch_down(600.0, 300.0);
+        assert_eq!(s.touch_up(600.0, 100.0, w, h), Action::Redraw);
+        assert!(!s.panel);
+        // bloqueio: só deslizar p/ cima desbloqueia
+        s.mode = Mode::Locked;
+        s.touch_down(600.0, 500.0);
+        assert_eq!(s.touch_up(600.0, 495.0, w, h), Action::None);
+        s.touch_down(600.0, 600.0);
+        assert_eq!(s.touch_up(600.0, 300.0, w, h), Action::Redraw);
+        assert_eq!(s.mode, Mode::Home);
+    }
+
+    #[test]
+    fn dates_and_notifs() {
+        assert_eq!(format_date(0), "qui, 1 jan 1970");
+        assert_eq!(format_date(20_784), "sex, 27 nov 2026");
+        assert_eq!(parse_notifs("ok A\x1fb\x1eC\x1f").unwrap(), [("A".into(), "b".into()), ("C".into(), String::new())]);
+        assert_eq!(parse_notifs("ok").unwrap(), Vec::<(String, String)>::new());
     }
 
     /// Preview: `SHELL_PREVIEW=/tmp/x cargo test -- --ignored preview` grava x-home.ppm e x-recents.ppm.
@@ -358,8 +517,10 @@ mod tests {
         let mut s = Shell::new();
         s.apps = parse_apps("ok com.android.settings/.Settings com.android.gallery3d/.app.GalleryActivity com.android.calendar/.AllInOneActivity org.lineageos.jelly/.MainActivity com.android.contacts/.Main com.android.deskclock/.DeskClock org.lineageos.eleven/.Main com.android.documentsui/.Launcher org.lineageos.etar/.Main com.android.camera2/.Camera").unwrap();
         s.recents = vec!["com.android.gallery3d/.app.GalleryActivity".into(), "com.android.settings/.Settings".into()];
-        for (m, name) in [(Mode::Home, "home"), (Mode::Recents, "recents")] {
+        s.notifs = vec![("Atualização do sistema".into(), "LangeOS 0.1 pronto para instalar".into()), ("Agenda".into(), "Reunião às 15:00".into())];
+        for (m, panel, name) in [(Mode::Home, false, "home"), (Mode::Recents, false, "recents"), (Mode::Locked, false, "locked"), (Mode::Home, true, "panel")] {
             s.mode = m;
+            s.panel = panel;
             let mut px = vec![0u32; w * h];
             s.draw(&mut Canvas { px: &mut px, w, h }, "10:42", Some(76));
             let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
@@ -374,8 +535,10 @@ mod tests {
         let mut px = vec![0u32; w * h];
         let mut s = Shell::new();
         s.apps = parse_apps("ok com.android.settings/.Settings").unwrap();
-        for m in [Mode::Home, Mode::Recents, Mode::App] {
+        s.notifs = vec![("Título".into(), "texto".into())];
+        for (m, panel) in [(Mode::Locked, false), (Mode::Home, false), (Mode::Recents, false), (Mode::App, true)] {
             s.mode = m;
+            s.panel = panel;
             s.recents = vec!["com.android.settings/.Settings".into()];
             s.draw(&mut Canvas { px: &mut px, w, h }, "12:34", Some(80));
         }

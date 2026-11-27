@@ -41,6 +41,7 @@ unsafe extern "C" {
     fn mknod(path: *const u8, mode: u32, dev: u64) -> i32;
     fn setns(fd: i32, nstype: i32) -> i32;
     fn kill(pid: i32, sig: i32) -> i32;
+    fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     fn setpgid(pid: i32, pgid: i32) -> i32;
     fn chroot(path: *const u8) -> i32;
     fn fchdir(fd: i32) -> i32;
@@ -409,7 +410,7 @@ impl Container {
         let (fds, rootfd): (Vec<i32>, i32) = (ns.iter().map(|f| f.as_raw_fd()).collect(), root.as_raw_fd());
         let mut cmd = Command::new(prog);
         cmd.args(args).env_clear().env("PATH", "/system/bin").stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
         unsafe {
             cmd.pre_exec(move || {
                 // grupo próprio: o watchdog mata intermediário + neto juntos (neto segura os pipes)
@@ -420,6 +421,9 @@ impl Container {
                 let pid = fork();
                 if pid < 0 { return Err(std::io::Error::last_os_error()); }
                 if pid > 0 {
+                    // intermediário nunca faz exec: fecha o pipe CLOEXEC do std (senão spawn() só volta
+                    // quando o neto termina; com saída > 64 KB ninguém lê o pipe = deadlock)
+                    for fd in 3..1024 { close(fd); }
                     let mut st = 0;
                     waitpid(pid, &mut st, 0);
                     _exit(if st & 0x7f == 0 { (st >> 8) & 0xff } else { 128 + (st & 0x7f) });
@@ -430,24 +434,42 @@ impl Container {
                 Ok(())
             })
         };
-        let child = cmd.spawn().map_err(|e| format!("spawn cmd: {e}"))?;
-        // Lê a saída enquanto roda (pipe de 64 KB enchia e o cmd travava escrevendo). Trava = mata:
-        // QEMU é lento, aparelho real responde em ms.
-        let pid = child.id() as i32;
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let d = done.clone();
-        thread::spawn(move || {
-            let t = Instant::now();
-            while !d.load(std::sync::atomic::Ordering::Relaxed) {
-                if t.elapsed() > Duration::from_secs(30) { unsafe { kill(-pid, 9) }; break; }
-                thread::sleep(Duration::from_millis(50));
+        let mut child = cmd.spawn().map_err(|e| format!("spawn cmd: {e}"))?;
+        // Lê com prazo. dumpsys repassa o fd do stdout via binder e quem escreve é o system_server:
+        // matar o processo não fecha essa cópia, então esperar EOF podia travar o daemon (root) p/ sempre.
+        // QEMU é lento; aparelho real responde em ms.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut stdout = child.stdout.take().ok_or("sem stdout")?;
+        let fd = stdout.as_raw_fd();
+        unsafe { fcntl(fd, 4 /* F_SETFL */, 0o4000 /* O_NONBLOCK */) };
+        let (mut buf, mut chunk) = (Vec::new(), [0u8; 16384]);
+        let complete = loop {
+            use std::io::Read;
+            match stdout.read(&mut chunk) {
+                Ok(0) => break true,
+                Ok(n) => { buf.extend_from_slice(&chunk[..n]); if buf.len() > 4 << 20 { break false; } }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline { break false; }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => break true,
             }
-        });
-        let out = child.wait_with_output().map_err(|e| e.to_string());
-        done.store(true, std::sync::atomic::Ordering::Relaxed);
-        let out = out?;
-        let text = String::from_utf8_lossy(&out.stdout).into_owned();
-        if out.status.success() { Ok(text) } else { Err(format!("cmd {}: {}", out.status, String::from_utf8_lossy(&out.stderr).trim())) }
+        };
+        drop(stdout);
+        // grupo próprio (setpgid): mata intermediário + neto se ainda vivos
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(st)) => break Some(st),
+                _ if Instant::now() >= deadline => { unsafe { kill(-(child.id() as i32), 9) }; let _ = child.wait(); break None; }
+                _ => thread::sleep(Duration::from_millis(20)),
+            }
+        };
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        match status {
+            Some(st) if complete && st.success() => Ok(text),
+            Some(st) if complete => Err(format!("{prog} {st}: {}", text.lines().last().unwrap_or("").trim())),
+            _ => Err(format!("{prog}: timeout")),
+        }
     }
 
     /// Comandos do shell (compositor). Resposta: "ok ..." ou "erro ...".
@@ -456,6 +478,7 @@ impl Container {
         let r = match verb {
             "apps" => self.android_cmd(&["package", "query-activities", "--brief", "-a", "android.intent.action.MAIN", "-c", "android.intent.category.LAUNCHER"])
                 .map(|out| launcher_components(&out).join(" ")),
+            "notifs" => self.android_run("/system/bin/dumpsys", &["notification", "--noredact"]).map(|d| encode_notifs(&parse_notifs(&d))),
             "launch" if valid_component(arg) => self.android_cmd(&["activity", "start-activity", "-n", arg]).map(|_| String::new()),
             "key" => match arg {
                 // Voltar na 1ª tela do app leva p/ a launcher do Android: avisa o shell ("home") p/ ele
@@ -541,6 +564,30 @@ fn launcher_components(out: &str) -> Vec<String> {
     let mut v: Vec<String> = out.lines().map(str::trim).filter(|l| valid_component(l)).map(String::from).collect();
     v.dedup();
     v
+}
+
+/// (título, texto) das notificações em `dumpsys notification --noredact` (extras android.title/text).
+fn parse_notifs(dump: &str) -> Vec<(String, String)> {
+    let val = |l: &str, key: &str| -> Option<String> {
+        let v = l.trim().strip_prefix(key)?;
+        // "String (texto)" ou "SpannableString (texto)"
+        let v = v.split_once('(')?.1;
+        Some(v.strip_suffix(')').unwrap_or(v).to_string())
+    };
+    let mut out: Vec<(String, String)> = vec![];
+    for l in dump.lines() {
+        if let Some(t) = val(l, "android.title=") { out.push((t, String::new())); }
+        else if let Some(x) = val(l, "android.text=") && let Some(last) = out.last_mut() && last.1.is_empty() { last.1 = x; }
+    }
+    out.dedup();
+    out.truncate(10);
+    out
+}
+
+/// Uma linha p/ o socket: entradas separadas por \x1e, título/texto por \x1f; controles viram espaço.
+fn encode_notifs(n: &[(String, String)]) -> String {
+    let clean = |s: &str| s.chars().map(|c| if c.is_control() { ' ' } else { c }).take(200).collect::<String>();
+    n.iter().map(|(t, x)| format!("{}\x1f{}", clean(t), clean(x))).collect::<Vec<_>>().join("\x1e")
 }
 
 /// `dumpsys activity activities`: a atividade no topo é a launcher do Android (HOME)?
@@ -652,6 +699,9 @@ mod shell_tests {
         assert!(!valid_component("a/b c"));
         assert!(!valid_component("a/b/c"));
         assert!(valid_component("com.x/com.x.Main$Inner"));
+        let d = "  NotificationRecord(...)\n      extras={\n        android.title=String (Bateria fraca)\n        android.text=String (15% restante)\n      android.title=SpannableString (Nova\nmsg)\n";
+        assert_eq!(parse_notifs(d), [("Bateria fraca".to_string(), "15% restante".to_string()), ("Nova".to_string(), String::new())]);
+        assert_eq!(encode_notifs(&[("a\x1eb".into(), "c".into())]), "a b\x1fc");
         assert!(top_is_home("  x\n      topResumedActivity=ActivityRecord{6fa u0 com.android.launcher3/.uioverrides.QuickstepLauncher} t6}"));
         assert!(!top_is_home("      topResumedActivity=ActivityRecord{6fa u0 com.android.gallery3d/.app.GalleryActivity t7}"));
     }

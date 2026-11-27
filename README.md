@@ -25,6 +25,11 @@ Launcher nativa do LangeOS (apps do container Android, nomes em português) e o 
 ![Launcher nativa](docs/img/launcher-nativa.png)
 ![Galeria aberta pela launcher](docs/img/launcher-abre-galeria.png)
 
+Tela de bloqueio e painel rápido (prévia do shell, `cargo test -- --ignored preview`):
+
+![Tela de bloqueio](docs/img/tela-bloqueio.png)
+![Painel rápido](docs/img/painel-rapido.png)
+
 Toque funcionando (tap via virtio-tablet abre o menu do ícone da Galeria; barra de status nativa do LangeOS no topo):
 
 ![Toque no Android](docs/img/android-toque-qemu.png)

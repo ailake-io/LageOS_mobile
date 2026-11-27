@@ -249,7 +249,8 @@ impl Tablet {
         while let Ok(n) = self.file.read(&mut buf) && n > 0 {
             for ev in buf[..n].chunks_exact(24) { self.feed(ev, sw, sh, &mut out); }
         }
-        if !out.is_empty() && INPUT_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
+        // Down/Up sempre; movimento só nos primeiros (diagnóstico sem inundar o console)
+        if out.iter().any(|e| !matches!(e, TouchEv::Motion(..))) || (!out.is_empty() && INPUT_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5) {
             eprintln!("[compositor] toque {out:?}");
         }
         out
@@ -543,7 +544,7 @@ impl App {
     /// Android, como coordenadas da janela; com foco numa subsurface (ex.: barra de navegação) o
     /// toque caía no lugar errado.
     fn surface_at(&self, px: f64, py: f64) -> Option<(WlSurface, smithay::utils::Point<f64, smithay::utils::Logical>)> {
-        if self.shell.mode != Mode::App { return None; }
+        if self.shell.wants_touch() { return None; }
         let (w, h) = (self.size.0 as f64, (self.size.1 - (BAR + NAV) as i32) as f64);
         let (x, y) = (px, py - BAR as f64);
         if x < 0.0 || y < 0.0 || x >= w || y >= h { return None; }
@@ -559,7 +560,7 @@ impl App {
         screen.fb.fill(0xff10_1418); // fundo LangeOS
         let (fw, fh) = (screen.w, screen.h);
         if self.shell.mode == Mode::App {
-            // janela Android só entre as barras (ela é configurada com essa altura)
+            // janela Android (painel rápido é desenhado por cima pelo shell) só entre as barras (ela é configurada com essa altura)
             let area = &mut screen.fb[..(fh - NAV) * fw];
             for (surf, x, y, dw, dh) in self.layers() {
                 if let Some(img) = self.images.get(&surf.id()) { draw(area, fw, fh - NAV, img, x, y, dw, dh); }
@@ -581,11 +582,14 @@ impl App {
         if !self.touch_shell { return self.touch_android(ev); }
         if ev == TouchEv::Up {
             let (x, y) = self.touch_pos;
-            match self.shell.touch_up(x, y, w, h) {
+            let action = self.shell.touch_up(x, y, w, h);
+            if action != Action::None { eprintln!("[compositor] shell {action:?} (modo {:?}, painel {})", self.shell.mode, self.shell.panel); }
+            match action {
                 Action::None => {}
                 Action::Redraw => self.dirty = true,
                 Action::Launch(c) => { self.requests.push(format!("launch {c}")); self.dirty = true; }
                 Action::Key(k) => { self.requests.push(format!("key {k}")); self.dirty = true; }
+                Action::Notifs => { self.requests.push("notifs".into()); self.dirty = true; }
             }
         }
     }
@@ -800,14 +804,17 @@ fn main() {
                         eprintln!("[compositor] {} apps", apps.len());
                         app.shell.apps = apps;
                         // posição de cada ícone (testes automáticos tocam por aqui)
-                        for (a, (x, y, w, h)) in app.shell.apps.iter().zip(app.shell.grid(screen.w, screen.h)) {
-                            eprintln!("[compositor] icone {} {} {}", a.label, x + w / 2, y + h / 2);
+                        for (i, (x, y, w, h)) in app.shell.grid(screen.w, screen.h) {
+                            eprintln!("[compositor] icone {} {} {}", app.shell.apps[i].label, x + w / 2, y + h / 2);
                         }
                         app.dirty = true;
                     }
                     Some(_) => {}
                     None => eprintln!("[compositor] apps: {}", reply.chars().take(120).collect::<String>()),
                 }
+            } else if req == "notifs" {
+                eprintln!("[compositor] notifs: {}", reply.chars().take(120).collect::<String>());
+                if let Some(n) = shell::parse_notifs(&reply) { app.shell.notifs = n; app.dirty = true; }
             } else if req == "key back" && reply == "ok home" {
                 app.shell.mode = Mode::Home; // saiu do app: tela inicial nativa, não a launcher do Android
                 app.dirty = true;
