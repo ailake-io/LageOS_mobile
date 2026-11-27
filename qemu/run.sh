@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Boot LangeOS no QEMU aarch64: kernel próprio + /system EROFS read-only (vda) + /data ext4 persistente (vdb).
 # Sair do QEMU: Ctrl-A depois X.  Uso: [MEM=MB] [SMP=n] [POWEROFF=s] [QUIET=] [ANDROID=1] ./run.sh [segundos_timeout]
+# GPU=virgl: GPU 3D do host via virglrenderer (QEMU do apt, -display egl-headless). Padrão: 2D + Mesa em software.
 # ANDROID=1: + system/vendor do Waydroid (../android/fetch.sh) e container Android aberto no boot.
 # Apagar build/data.img zera os dados persistentes.
 set -euo pipefail
@@ -22,6 +23,12 @@ S=$R/etc/lange/services
 printf 'exec=/bin/heartbeat\nrestart=always\n' > "$S/00-heartbeat.svc"
 printf 'exec=/bin/memhog\nrestart=never\nmemory_max=16M\n' > "$S/50-memhog.svc"
 DISKS=(); CMDLINE_EXTRA=
+QEMU=qemu-system-aarch64
+GPU_DEV=(-device virtio-gpu-device)  # 2D: Mesa renderiza por software (llvmpipe/kms_swrast)
+if [ "${GPU:-}" = virgl ]; then
+  QEMU=/usr/bin/qemu-system-aarch64  # QEMU do Ubuntu tem virglrenderer; o do Homebrew não
+  GPU_DEV=(-device virtio-gpu-gl-device -display egl-headless)
+fi
 if [ -n "${ANDROID:-}" ]; then
   A=../android/build
   [ -f $A/system.img ] && [ -f $A/vendor.img ] || { echo "falta imagem Android: rode ../android/fetch.sh" >&2; exit 1; }
@@ -30,14 +37,14 @@ if [ -n "${ANDROID:-}" ]; then
   DISKS=(-drive file=$A/data.img,format=raw,if=none,id=adata -device virtio-blk-device,drive=adata
          -drive file=$A/vendor.img,format=raw,if=none,id=avendor,readonly=on -device virtio-blk-device,drive=avendor
          -drive file=$A/system.img,format=raw,if=none,id=asys,readonly=on -device virtio-blk-device,drive=asys
-         -device virtio-gpu-device)  # GPU 2D: Mesa renderiza por software (llvmpipe/kms_swrast)
+         "${GPU_DEV[@]}")
   printf '/dev/vdc /android/root ext4 ro\n/dev/vdd /android/root/vendor ext4 ro\n/dev/vde /android/root/data ext4 rw\n' >> "$R/etc/lange/fstab"
   # 1º estágio do init Android (mknod /dev, fstab) é trabalho do host: entra no selinux_setup
   # (carrega a sepolicy do Android, permissiva) que então chama o 2º estágio.
   # gráficos estilo Waydroid: EGL Mesa + gralloc gbm no render node
   GFX_PROPS='--prop ro.hardware.egl=mesa --prop ro.hardware.gralloc=gbm --prop gralloc.gbm.device=/dev/dri/renderD128 '
   # virtio-gpu sem virgl não tem driver Mesa 3D: força kms_swrast/llvmpipe (env da Mesa vira prop debug.mesa.* no Android)
-  GFX_PROPS+='--prop debug.mesa.loader.driver.override=kms_swrast --prop debug.mesa.gbm.always.software=true --prop debug.mesa.libgl.always.software=true '
+  [ "${GPU:-}" = virgl ] || GFX_PROPS+='--prop debug.mesa.loader.driver.override=kms_swrast --prop debug.mesa.gbm.always.software=true --prop debug.mesa.libgl.always.software=true '
   printf 'exec=/bin/langedroid daemon --rootfs /android/root --idle-freeze %s %s%s--wayland-dir /run/lange --payload /system/bin/init selinux_setup\n' "${IDLE_FREEZE:-30}" "${DEBUG_LOGCAT:+--debug-logcat }" "$GFX_PROPS" > "$S/20-langedroid.svc"
   printf 'exec=/bin/langedroid ctl open\nrestart=never\n' > "$S/30-android-open.svc"
   MEM=${MEM:-3072}
@@ -60,7 +67,7 @@ mkfs.erofs --quiet -zlz4 --all-root "$OUT/system.erofs" "$R" >/dev/null
 
 # virtio-mmio moderno (1.0): virtio-gpu recusa o transporte legado em silêncio.
 # virtio-mmio no virt enumera ao contrário: último -device vira vda. Por isso data antes de system.
-${1:+timeout $1} qemu-system-aarch64 -M virt -cpu cortex-a53 -smp "${SMP:-4}" -m "${MEM:-1024}" -nographic -no-reboot \
+${1:+timeout $1} $QEMU -M virt -cpu cortex-a53 -smp "${SMP:-4}" -m "${MEM:-1024}" -nographic -no-reboot \
   -global virtio-mmio.force-legacy=false \
   -kernel "$KERNEL" "${DISKS[@]}" \
   -drive file="$OUT/data.img",format=raw,if=none,id=data -device virtio-blk-device,drive=data \
