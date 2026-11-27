@@ -53,8 +53,10 @@ fi
 mkfs.erofs --quiet -zlz4 --all-root "$OUT/system.erofs" "$R" >/dev/null
 [ -f "$OUT/data.img" ] || mkfs.ext4 -q -F "$OUT/data.img" 64M
 
+# virtio-mmio moderno (1.0): virtio-gpu recusa o transporte legado em silêncio.
 # virtio-mmio no virt enumera ao contrário: último -device vira vda. Por isso data antes de system.
 ${1:+timeout $1} qemu-system-aarch64 -M virt -cpu cortex-a53 -smp "${SMP:-4}" -m "${MEM:-1024}" -nographic -no-reboot \
+  -global virtio-mmio.force-legacy=false \
   -kernel "$KERNEL" "${DISKS[@]}" \
   -drive file="$OUT/data.img",format=raw,if=none,id=data -device virtio-blk-device,drive=data \
   -drive file="$OUT/system.erofs",format=raw,if=none,id=sys,readonly=on -device virtio-blk-device,drive=sys \
