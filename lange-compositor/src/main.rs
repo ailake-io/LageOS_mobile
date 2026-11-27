@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::{env, fs, thread};
+use std::{env, fs};
 
 use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufMappingMode, DmabufSyncFlags};
 use smithay::backend::allocator::{Buffer, Format, Fourcc, Modifier};
@@ -126,7 +126,14 @@ fn import_shm(buf: &wl_buffer::WlBuffer) -> Option<Image> {
 
 // ---------- virtio-gpu (virgl): trazer o conteúdo da GPU do host antes de ler ----------
 
+const FRAME: Duration = Duration::from_millis(33); // ~30 Hz
+
+#[repr(C)]
+struct PollFd { fd: i32, events: i16, revents: i16 }
+const POLLIN: i16 = 1;
+
 unsafe extern "C" {
+    fn poll(fds: *mut PollFd, n: std::ffi::c_ulong, timeout_ms: i32) -> i32;
     fn ioctl(fd: i32, request: std::ffi::c_ulong, ...) -> i32;
 }
 
@@ -244,6 +251,8 @@ struct App {
     seat_state: SeatState<App>,
     output: Output,
     images: HashMap<ObjectId, Image>,
+    /// buffers commitados ainda não copiados (1 por superfície)
+    pending: HashMap<ObjectId, wl_buffer::WlBuffer>,
     dirty: bool,
     size: (i32, i32),
     commits: u32,
@@ -258,31 +267,27 @@ impl CompositorHandler for App {
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
         &client.get_data::<ClientState>().unwrap().compositor
     }
-    /// Copia o buffer anexado p/ uma imagem nossa e libera o buffer ao cliente imediatamente.
+    /// Só guarda o buffer mais recente da superfície; a cópia (cara: readback virtio) acontece uma vez
+    /// por quadro em import_pending(). Buffer substituído antes de ser desenhado volta ao cliente já.
     fn commit(&mut self, surface: &WlSurface) {
         let assignment = with_states(surface, |s| s.cached_state.get::<SurfaceAttributes>().current().buffer.take());
         match assignment {
             Some(BufferAssignment::NewBuffer(buf)) => {
-                let kind = if get_dmabuf(&buf).is_ok() { "dmabuf" } else { "shm" };
-                let img = match get_dmabuf(&buf) { Ok(d) => import_dmabuf(d, self.card.as_ref()), Err(_) => import_shm(&buf) };
-                // ponytail: log só dos primeiros commits (diagnóstico da etapa 7), sem inundar o console
-                if self.commits < 20 {
-                    self.commits += 1;
-                    let pixel = img.as_ref().and_then(|i| i.px.get(i.px.len() / 2).copied());
-                    eprintln!("[compositor] commit {kind} {:?} pixel_central={pixel:08x?}", img.as_ref().map(|i| (i.w, i.h)));
-                }
-                match img {
-                    Some(img) => { self.images.insert(surface.id(), img); }
-                    None => eprintln!("[compositor] buffer com formato não suportado em {:?}", surface.id()),
-                }
-                buf.release();
-                self.dirty = true;
+                if let Some(old) = self.pending.insert(surface.id(), buf) { old.release(); }
             }
-            Some(BufferAssignment::Removed) => { self.images.remove(&surface.id()); self.dirty = true; }
-            None => self.dirty = true, // posição de subsurface/viewport pode ter mudado
+            Some(BufferAssignment::Removed) => {
+                if let Some(old) = self.pending.remove(&surface.id()) { old.release(); }
+                self.images.remove(&surface.id());
+            }
+            None => {} // posição de subsurface/viewport pode ter mudado
         }
+        self.dirty = true;
     }
-    fn destroyed(&mut self, surface: &WlSurface) { self.images.remove(&surface.id()); self.dirty = true; }
+    fn destroyed(&mut self, surface: &WlSurface) {
+        if let Some(old) = self.pending.remove(&surface.id()) { old.release(); }
+        self.images.remove(&surface.id());
+        self.dirty = true;
+    }
 }
 
 impl XdgShellHandler for App {
@@ -342,8 +347,28 @@ impl ClientData for ClientState {
 }
 
 impl App {
+    /// Copia os buffers pendentes p/ imagens e devolve os buffers aos clientes.
+    fn import_pending(&mut self) {
+        for (id, buf) in std::mem::take(&mut self.pending) {
+            let kind = if get_dmabuf(&buf).is_ok() { "dmabuf" } else { "shm" };
+            let img = match get_dmabuf(&buf) { Ok(d) => import_dmabuf(d, self.card.as_ref()), Err(_) => import_shm(&buf) };
+            buf.release();
+            // ponytail: log só das primeiras cópias (diagnóstico da etapa 7), sem inundar o console
+            if self.commits < 20 {
+                self.commits += 1;
+                let lit = img.as_ref().map_or(0, |i| i.px.iter().filter(|&&p| p & 0x00ff_ffff != 0).count());
+                eprintln!("[compositor] commit {kind} {:?} pixels_acesos={lit}", img.as_ref().map(|i| (i.w, i.h)));
+            }
+            match img {
+                Some(img) => { self.images.insert(id, img); }
+                None => eprintln!("[compositor] buffer com formato não suportado em {id:?}"),
+            }
+        }
+    }
+
     /// Compõe todas as janelas (e subsurfaces) no framebuffer.
     fn render(&mut self, screen: &mut Screen) {
+        self.import_pending();
         screen.fb.fill(0xff10_1418); // fundo LangeOS
         let (fw, fh) = (screen.w, screen.h);
         let images = &self.images;
@@ -428,6 +453,7 @@ fn main() {
         seat_state: SeatState::new(),
         output,
         images: HashMap::new(),
+        pending: HashMap::new(),
         dirty: true,
         size: (screen.w as i32, screen.h as i32),
         commits: 0,
@@ -449,25 +475,34 @@ fn main() {
 
     let start = Instant::now();
     let mut last_shot = Instant::now() - Duration::from_secs(10);
+    let mut last_frame = Instant::now() - FRAME;
     let mut clients = Vec::new();
     loop {
+        // Acorda quando um cliente fala (o socket dele não enche) ou no próximo quadro.
+        let until_frame = FRAME.saturating_sub(last_frame.elapsed()).as_millis() as i32;
+        let mut fds = [
+            PollFd { fd: listener.as_raw_fd(), events: POLLIN, revents: 0 },
+            PollFd { fd: display.backend().poll_fd().as_raw_fd(), events: POLLIN, revents: 0 },
+        ];
+        unsafe { poll(fds.as_mut_ptr(), fds.len() as _, if app.dirty { until_frame.max(1) } else { 1000 }) };
+
         while let Ok(Some(stream)) = listener.accept() {
             if let Ok(c) = display.handle().insert_client(stream, Arc::new(ClientState::default())) { clients.push(c); }
         }
         let _ = display.dispatch_clients(&mut app);
-        if app.dirty {
+        // ponytail: sem vblank; quadro no máximo a cada FRAME (limita o custo do readback no QEMU)
+        if app.dirty && last_frame.elapsed() >= FRAME {
             app.dirty = false;
+            last_frame = Instant::now();
             app.render(&mut screen);
             screen.present();
+            app.send_frames(start.elapsed().as_millis() as u32);
         }
-        app.send_frames(start.elapsed().as_millis() as u32);
         let _ = display.flush_clients();
         if let Some(p) = &shot && last_shot.elapsed() >= Duration::from_secs(2) {
             last_shot = Instant::now();
             if let Err(e) = screen.screenshot(p) { eprintln!("[compositor] screenshot: {e}"); }
         }
-        // ponytail: polling ~60 Hz; trocar por calloop (epoll) + vblank quando medir bateria
-        thread::sleep(Duration::from_millis(16));
     }
 }
 
