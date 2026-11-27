@@ -25,8 +25,8 @@ const SHELL_SOCK: &str = "/run/langedroid-shell.sock";
 const SHELL_UID: u32 = 600;
 /// helper Java (android/icons) que renderiza os ícones dos apps dentro do container
 const ICONS_JAR: &str = "/usr/share/lange/lange-icons.jar";
-/// cópia do jar dentro do container (dir só do root, ver `icons`)
-const ICONS_JAR_IN_ANDROID: &str = "/data/lange-host/lange-icons.jar";
+/// fd em que o neto do `android_run` recebe o jar (CLASSPATH=/proc/self/fd/N)
+const JAR_FD: i32 = 200;
 const CG: &str = "/sys/fs/cgroup/android";
 
 unsafe extern "C" {
@@ -49,6 +49,7 @@ unsafe extern "C" {
     fn setpgid(pid: i32, pgid: i32) -> i32;
     fn chroot(path: *const u8) -> i32;
     fn fchdir(fd: i32) -> i32;
+    fn dup2(old: i32, new: i32) -> i32;
     fn socket(domain: i32, ty: i32, proto: i32) -> i32;
     fn send(fd: i32, buf: *const u8, len: usize, flags: i32) -> isize;
     fn recv(fd: i32, buf: *mut u8, len: usize, flags: i32) -> isize;
@@ -71,10 +72,6 @@ const MNT_DETACH: i32 = 2;
 const SYS_PIVOT_ROOT: i64 = 41;
 #[cfg(target_arch = "x86_64")]
 const SYS_PIVOT_ROOT: i64 = 155;
-#[cfg(target_arch = "aarch64")]
-const O_NOFOLLOW: i32 = 0o100000;
-#[cfg(target_arch = "x86_64")]
-const O_NOFOLLOW: i32 = 0o400000;
 
 fn cstr(s: &str) -> std::ffi::CString { std::ffi::CString::new(s).unwrap() }
 
@@ -291,6 +288,28 @@ fn hold_input_fifos(pid: u32) -> Vec<fs::File> {
     held
 }
 
+/// Ambiente p/ programas do Android (app_process precisa de BOOTCLASSPATH etc.). O init exporta essas
+/// variáveis só p/ os serviços: copia do zygote (exe = app_process do /system, uid 0), só chaves da
+/// lista e classpath apontando p/ partições read-only. Nada de LD_* ou outra variável do container.
+fn android_env(init: u32) -> Vec<(String, String)> {
+    let kids = fs::read_to_string(format!("/proc/{init}/task/{init}/children")).unwrap_or_default();
+    let zygote = kids.split_whitespace().find(|p| {
+        fs::read_link(format!("/proc/{p}/exe")).is_ok_and(|e| e.as_os_str() == "/system/bin/app_process64")
+            && fs::read_to_string(format!("/proc/{p}/status")).is_ok_and(|s| s.lines().any(|l| l.starts_with("Uid:\t0\t")))
+    });
+    let raw = zygote.and_then(|p| fs::read(format!("/proc/{p}/environ")).ok()).unwrap_or_default();
+    filter_env(&raw)
+}
+
+fn filter_env(raw: &[u8]) -> Vec<(String, String)> {
+    const KEYS: [&str; 10] = ["BOOTCLASSPATH", "DEX2OATBOOTCLASSPATH", "SYSTEMSERVERCLASSPATH", "ANDROID_ROOT", "ANDROID_DATA",
+        "ANDROID_ART_ROOT", "ANDROID_I18N_ROOT", "ANDROID_TZDATA_ROOT", "ANDROID_STORAGE", "ANDROID_ASSETS"];
+    let ro = |v: &str| v.split(':').all(|e| ["/system/", "/apex/", "/system_ext/"].iter().any(|p| e.starts_with(p)) && !e.contains(".."));
+    raw.split(|&b| b == 0).filter_map(|kv| std::str::from_utf8(kv).ok()?.split_once('='))
+        .filter(|(k, v)| KEYS.contains(k) && (!k.ends_with("CLASSPATH") || ro(v)) && v.starts_with('/') && !v.contains(".."))
+        .map(|(k, v)| (k.to_string(), v.to_string())).collect()
+}
+
 /// /proc/net/fib_trie tem endereço local fora de 127.0.0.0/8?
 fn has_ipv4(trie: &str) -> bool {
     let mut last = "";
@@ -473,14 +492,12 @@ impl Container {
         use std::os::unix::process::CommandExt;
         let (fds, rootfd): (Vec<i32>, i32) = (ns.iter().map(|f| f.as_raw_fd()).collect(), root.as_raw_fd());
         let mut cmd = Command::new(prog);
-        // ambiente de um filho do init (BOOTCLASSPATH, ANDROID_ROOT...: app_process precisa). O init
-        // exporta essas variáveis só p/ os serviços; o environ dele mesmo não as tem.
-        let kids = fs::read_to_string(format!("/proc/{init}/task/{init}/children")).unwrap_or_default();
-        let env = kids.split_whitespace().filter_map(|p| fs::read(format!("/proc/{p}/environ")).ok())
-            .find(|e| e.windows(14).any(|w| w == b"BOOTCLASSPATH="))
-            .unwrap_or_else(|| fs::read(format!("/proc/{init}/environ")).unwrap_or_default());
-        cmd.env_clear().envs(env.split(|&b| b == 0).filter_map(|kv| std::str::from_utf8(kv).ok()?.split_once('=')));
-        if prog.contains("app_process") { cmd.env("CLASSPATH", ICONS_JAR_IN_ANDROID); }
+        cmd.env_clear().envs(android_env(init));
+        // helper de ícones: jar aberto aqui, da imagem read-only do host; o neto herda o fd (nenhuma
+        // cópia num caminho que o Android possa trocar)
+        let jar = if prog.contains("app_process") { Some(fs::File::open(ICONS_JAR).map_err(|e| format!("{ICONS_JAR}: {e}"))?) } else { None };
+        let jarfd = jar.as_ref().map_or(-1, |f| f.as_raw_fd());
+        if jar.is_some() { cmd.env("CLASSPATH", format!("/proc/self/fd/{JAR_FD}")); }
         cmd.args(args).env("PATH", "/system/bin").stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped()).stderr(if prog.contains("app_process") { std::process::Stdio::inherit() } else { std::process::Stdio::null() }); // erro de VM/classe do helper de ícones vai p/ o console
         unsafe {
@@ -500,6 +517,8 @@ impl Container {
                     waitpid(pid, &mut st, 0);
                     _exit(if st & 0x7f == 0 { (st >> 8) & 0xff } else { 128 + (st & 0x7f) });
                 }
+                // dup2 limpa o CLOEXEC: o fd do jar sobrevive ao exec
+                if jarfd >= 0 && dup2(jarfd, JAR_FD) < 0 { return Err(std::io::Error::last_os_error()); }
                 if fchdir(rootfd) != 0 || chroot(b".\0".as_ptr()) != 0 || chdir(b"/\0".as_ptr()) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -556,19 +575,6 @@ impl Container {
 
     /// Comandos do shell (compositor). Resposta: "ok ..." ou "erro ...".
     fn icons(&self, arg: &str) -> Result<String, String> {
-        let init = self.android_init().ok_or("sem init do container")?;
-        // roda como root: o jar fica em dir só do root (não em /data/local/tmp, gravável pelo uid shell).
-        // Sem seguir symlink: dir conferido com lstat (dono 0, modo 0755) e arquivo recriado com create_new.
-        use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
-        let dir = format!("/proc/{init}/root/data/lange-host");
-        let _ = fs::DirBuilder::new().mode(0o755).create(&dir);
-        let m = fs::symlink_metadata(&dir).map_err(|e| format!("{dir}: {e}"))?;
-        if !m.is_dir() || m.uid() != 0 || m.mode() & 0o022 != 0 { return Err(format!("{dir}: dono/modo inseguro")); }
-        let jar = format!("{dir}/lange-icons.jar");
-        let _ = fs::remove_file(&jar);
-        let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o644).custom_flags(O_NOFOLLOW).open(&jar)
-            .map_err(|e| format!("{jar}: {e}"))?;
-        std::io::copy(&mut fs::File::open(ICONS_JAR).map_err(|e| format!("{ICONS_JAR}: {e}"))?, &mut f).map_err(|e| e.to_string())?;
         let mut a = vec!["/system/bin", "LangeIcons"];
         a.extend(arg.split(' '));
         let out = self.android_run("/system/bin/app_process64", &a)?;
@@ -821,6 +827,15 @@ mod shell_tests {
         let lo = "Main:\n  +-- 127.0.0.0/8 2 0 2\n     |-- 127.0.0.1\n        /32 host LOCAL\n";
         assert!(!super::has_ipv4(lo));
         assert!(super::has_ipv4(&format!("{lo}  |-- 10.0.2.15\n     /32 host LOCAL\n")));
+    }
+
+    #[test]
+    fn env_filter() {
+        let raw = b"BOOTCLASSPATH=/apex/a.jar:/system/framework/b.jar\0LD_PRELOAD=/data/x.so\0ANDROID_ROOT=/system\0SYSTEMSERVERCLASSPATH=/data/evil.jar\0";
+        let env = super::filter_env(raw);
+        assert_eq!(env.len(), 2);
+        assert!(env.iter().any(|(k, _)| k == "BOOTCLASSPATH"));
+        assert!(!env.iter().any(|(k, _)| k == "LD_PRELOAD" || k == "SYSTEMSERVERCLASSPATH"));
     }
 
     #[test]
