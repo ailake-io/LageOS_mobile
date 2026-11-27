@@ -146,12 +146,14 @@ const VIRTGPU_WAIT: std::ffi::c_ulong = drm_iowr(0x08, 8);
 /// TRANSFER_FROM_HOST (o que o driver virgl da Mesa faz ao mapear). Em GPU real o ioctl falha
 /// (não é virtio) e nada muda. ponytail: transfere o quadro inteiro a cada commit.
 /// Resultado p/ diagnóstico: Ok, ou o passo + erro que falhou.
-fn virtio_readback(card: &Card, dmabuf: &Dmabuf, w: u32, h: u32, stride: u32) -> Result<(), String> {
+fn virtio_readback(card: &Card, dmabuf: &Dmabuf, w: u32, h: u32) -> Result<(), String> {
     use drm::control::Device as _;
     let fd = dmabuf.handles().next().ok_or("sem plano")?;
     let handle = card.prime_fd_to_buffer(fd).map_err(|e| format!("prime import: {e}"))?;
     let bo: u32 = handle.into();
-    let mut xfer = [bo, 0, 0, 0, w, h, 1, 0, 0, stride, 0u32]; // handle, box{x,y,z,w,h,d}, level, offset, stride, layer_stride
+    // handle, box{x,y,z,w,h,d}, level, offset, stride, layer_stride. stride/layer_stride = 0: recurso
+    // não-blob usa o stride do próprio recurso; o kernel devolve EINVAL se vier preenchido.
+    let mut xfer = [bo, 0, 0, 0, w, h, 1, 0, 0, 0, 0u32];
     let mut wait = [bo, 0u32];
     let fd = card.0.as_fd().as_raw_fd();
     let res = unsafe {
@@ -172,7 +174,7 @@ fn import_dmabuf(dmabuf: &Dmabuf, card: Option<&Card>) -> Option<Image> {
     let stride = dmabuf.strides().next()? as usize;
     let size = dmabuf.size();
     if let Some(card) = card {
-        let r = virtio_readback(card, dmabuf, size.w as u32, size.h as u32, stride as u32);
+        let r = virtio_readback(card, dmabuf, size.w as u32, size.h as u32);
         if READBACK_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 { eprintln!("[compositor] readback virtio: {r:?}"); }
     }
     let _ = dmabuf.sync_plane(0, DmabufSyncFlags::START | DmabufSyncFlags::READ);
