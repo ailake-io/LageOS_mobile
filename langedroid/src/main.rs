@@ -41,6 +41,7 @@ unsafe extern "C" {
     fn mknod(path: *const u8, mode: u32, dev: u64) -> i32;
     fn setns(fd: i32, nstype: i32) -> i32;
     fn kill(pid: i32, sig: i32) -> i32;
+    fn setpgid(pid: i32, pgid: i32) -> i32;
     fn chroot(path: *const u8) -> i32;
     fn fchdir(fd: i32) -> i32;
 }
@@ -411,6 +412,8 @@ impl Container {
             .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
         unsafe {
             cmd.pre_exec(move || {
+                // grupo próprio: o watchdog mata intermediário + neto juntos (neto segura os pipes)
+                if setpgid(0, 0) != 0 { return Err(std::io::Error::last_os_error()); }
                 for &fd in &fds { if setns(fd, 0) != 0 { return Err(std::io::Error::last_os_error()); } }
                 // setns(pid) só vale p/ filhos: bifurca. Sem isso /proc/self (do /proc do container) não
                 // existe p/ este processo e o linker do Android aborta. Intermediário repassa o status.
@@ -436,7 +439,7 @@ impl Container {
         thread::spawn(move || {
             let t = Instant::now();
             while !d.load(std::sync::atomic::Ordering::Relaxed) {
-                if t.elapsed() > Duration::from_secs(30) { unsafe { kill(pid, 9) }; break; }
+                if t.elapsed() > Duration::from_secs(30) { unsafe { kill(-pid, 9) }; break; }
                 thread::sleep(Duration::from_millis(50));
             }
         });

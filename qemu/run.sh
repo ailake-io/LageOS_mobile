@@ -55,6 +55,8 @@ if [ -n "${ANDROID:-}" ]; then
   # QEMU emulado (TCG) é ~10-20x mais lento: Watchdog matava o system_server (Blocked in handler).
   # Prop feita p/ emuladores (Cuttlefish); só no QEMU, aparelho real mantém os timeouts normais.
   GFX_PROPS+='--prop ro.hw_timeout_multiplier=10 '
+  # navegação é do shell do LangeOS (◁ ○ □): sem a barra de navegação do Android (prop de aparelho com botões físicos)
+  GFX_PROPS+='--prop qemu.hw.mainkeys=1 '
   # virtio-gpu sem virgl não tem driver Mesa 3D: força kms_swrast/llvmpipe (env da Mesa vira prop debug.mesa.* no Android)
   [ "${GPU:-}" = virgl ] || GFX_PROPS+='--prop debug.mesa.loader.driver.override=kms_swrast --prop debug.mesa.gbm.always.software=true --prop debug.mesa.libgl.always.software=true '
   printf 'exec=/bin/langedroid daemon --rootfs /android/root --idle-freeze %s %s%s--wayland-dir /run/lange --payload /system/bin/init selinux_setup\n' "${IDLE_FREEZE:-30}" "${DEBUG_LOGCAT:+--debug-logcat }" "$GFX_PROPS" > "$S/20-langedroid.svc"

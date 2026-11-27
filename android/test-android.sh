@@ -21,6 +21,9 @@ while kill -0 $qpid 2>/dev/null; do
     # coordenadas em fração da tela (1280x800 no QEMU)
     python3 qmp.py "$Q" tap "$(python3 -c "print($x/1280)")" "$(python3 -c "print($y/800)")" && touched=1
     sleep 30  # compositor grava screen-post-touch.ppm 20 s após soltar (com fsync) + commit do ext4
+    # Voltar nativo (◁ da barra de navegação, x = meio - 140) na 1ª tela da Galeria -> tela inicial nativa
+    python3 qmp.py "$Q" tap "$(python3 -c "print((640-140)/1280)")" "$(python3 -c "print(776/800)")"
+    for _ in $(seq 24); do grep -aq 'key back -> ok home' build/boot.log && break; sleep 5; done
     python3 qmp.py "$Q" quit 2>/dev/null; break
   fi
   sleep 5
@@ -57,6 +60,7 @@ a=open('build/touch-pre.ppm','rb').read(); b=open('build/touch-post.ppm','rb').r
 assert a[:2]==b[:2]==b'P6' and len(a)==len(b)
 n=min(len(a),len(b))//3; print(sum(1 for i in range(0,n*3,3) if a[i:i+3]!=b[i:i+3])*100//max(n,1))" 2>/dev/null || echo 0)
   python3 ppm2png.py build/touch-post.ppm build/touch-post.png 2>/dev/null
+  grep -aq 'key back -> ok home' build/boot.log && echo "OK    voltar no app volta à tela inicial nativa" || { echo "FALTA voltar no app voltar à tela inicial nativa"; fail=1; }
   grep -aq 'launch com.android.gallery3d/[^ ]* -> ok' build/boot.log && echo "OK    launcher nativa abriu a Galeria (langedroid launch)" || { echo "FALTA launcher nativa abrir a Galeria"; fail=1; }
   [ "$touch_diff" -ge 2 ] && echo "OK    toque muda a tela (${touch_diff}% mudou; android/build/touch-post.png)" || { echo "FALTA toque muda a tela (${touch_diff}% mudou)"; fail=1; }
 else echo "FALTA teste de toque (boot não completou)"; fail=1; fi
