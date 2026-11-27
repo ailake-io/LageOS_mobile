@@ -201,6 +201,9 @@ fn import_dmabuf(dmabuf: &Dmabuf, card: Option<&Card>) -> Option<Image> {
 // ---------- shell nativo (src/shell.rs) ----------
 
 mod shell;
+mod pin;
+const PIN_DIR: &str = "/data/lange";
+const PIN_FILE: &str = "/data/lange/pin";
 use shell::{Action, Canvas, Mode, Shell, BAR, NAV};
 
 /// "HH:MM" UTC. ponytail: sem fuso horário (sem tzdata no rootfs); ler TZ quando houver config de usuário.
@@ -600,6 +603,11 @@ impl App {
                 Action::Launch(c) => { self.requests.push(format!("launch {c}")); self.dirty = true; }
                 Action::Key(k) => { self.requests.push(format!("key {k}")); self.dirty = true; }
                 Action::Notifs => { self.requests.push("notifs".into()); self.dirty = true; }
+                Action::SavePin => {
+                    let r = self.shell.pin.as_ref().map(|p| p.save(PIN_FILE));
+                    eprintln!("[compositor] PIN {}", match r { Some(Ok(())) => "salvo".to_string(), Some(Err(e)) => format!("não salvo: {e}"), None => "?".into() });
+                    self.dirty = true;
+                }
                 Action::Volume(v) => { self.requests.push(format!("volume {v}")); self.dirty = true; }
             }
         }
@@ -755,6 +763,11 @@ fn main() {
         let _ = fs::create_dir_all(dir);
         let _ = std::os::unix::fs::chown(dir, Some(COMPOSITOR_UID), Some(COMPOSITOR_UID));
     }
+    // PIN da tela de bloqueio: dir só do compositor (0700)
+    let _ = fs::create_dir_all(PIN_DIR);
+    let _ = std::os::unix::fs::chown(PIN_DIR, Some(COMPOSITOR_UID), Some(COMPOSITOR_UID));
+    let _ = fs::set_permissions(PIN_DIR, fs::Permissions::from_mode(0o700));
+    app.shell.pin = pin::Pin::load(PIN_FILE);
     let mut tablet = Tablet::open();
     if tablet.is_none() { eprintln!("[compositor] sem dispositivo de toque"); }
     drop_root();

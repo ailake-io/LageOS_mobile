@@ -25,7 +25,7 @@ impl AppEntry {
 
 /// O que o compositor deve fazer depois de um toque no shell.
 #[derive(Debug, PartialEq)]
-pub enum Action { None, Redraw, Launch(String), Key(&'static str), Notifs, Volume(u8) }
+pub enum Action { None, Redraw, Launch(String), Key(&'static str), Notifs, Volume(u8), SavePin }
 
 /// Nome curto a partir do pacote: com.android.gallery3d -> "Gallery". ponytail: sem o rótulo real do
 /// APK (precisaria ler resources.arsc); trocar quando o langedroid devolver o label.
@@ -141,6 +141,9 @@ impl Canvas<'_> {
 
 // ---------- shell ----------
 
+/// Largura dos botões do painel (Bloquear, PIN).
+const BTN_W: i32 = 150;
+
 /// Início (x) dos controles deslizantes do painel (texto à esquerda).
 const SLIDER_X: i32 = 110;
 
@@ -165,17 +168,39 @@ pub struct Shell {
     pub net: Option<String>,
     /// ícones reais renderizados pelo Android (ARGB, ICON x ICON) por componente
     pub icons: std::collections::HashMap<String, Vec<u32>>,
+    /// PIN gravado (None = desbloqueio só deslizando)
+    pub pin: Option<crate::pin::Pin>,
+    /// teclado do PIN aberto (por cima de tudo) e em qual passo
+    pub pin_step: Option<PinStep>,
+    pin_input: String,
+    pin_new: String,
+    pin_msg: &'static str,
+    pin_fails: u32,
+    pin_wait_until: Option<std::time::Instant>,
 }
+
+/// Passos do teclado do PIN: desbloquear, ou trocar (atual -> novo -> confirmar).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PinStep { Unlock, Current, New, Confirm }
+
+const PIN_MIN: usize = 4;
+const PIN_MAX: usize = 8;
+/// erros seguidos antes da espera
+const PIN_TRIES: u32 = 5;
+const PIN_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// teclado: 3 colunas x 4 linhas (1-9, ⌫ 0 OK)
+const KEY: i32 = 76;
+const KEY_GAP: i32 = 96;
 
 pub const VOL_MAX: u8 = 15;
 
 impl Shell {
     pub fn new() -> Shell {
-        Shell { mode: Mode::Locked, apps: vec![], recents: vec![], font: Font::new(), down: None, page: 0, panel: false, notifs: vec![], brightness: 100, volume: 8, net: None, icons: Default::default() }
+        Shell { mode: Mode::Locked, apps: vec![], recents: vec![], font: Font::new(), down: None, page: 0, panel: false, notifs: vec![], brightness: 100, volume: 8, net: None, icons: Default::default(), pin: None, pin_step: None, pin_input: String::new(), pin_new: String::new(), pin_msg: "", pin_fails: 0, pin_wait_until: None }
     }
 
     /// Shell recebe o toque (e não a janela Android)?
-    pub fn wants_touch(&self) -> bool { self.mode != Mode::App || self.panel }
+    pub fn wants_touch(&self) -> bool { self.mode != Mode::App || self.panel || self.pin_step.is_some() }
 
     /// Células por página e nº de páginas da grade.
     fn per_page(w: usize, h: usize) -> (i32, i32) {
@@ -225,6 +250,10 @@ impl Shell {
         let Some((sx, sy)) = self.down.take() else { return Action::None };
         let (dx, dy) = (x - sx, y - sy);
         let swipe = dx.abs() > 60.0 || dy.abs() > 60.0;
+        if self.pin_step.is_some() {
+            if swipe { return Action::None; }
+            return self.pin_tap(x as i32, y as i32, w, h);
+        }
         if self.panel {
             // painel: arrastar p/ cima ou tocar fora fecha
             if (swipe && dy < 0.0) || (!swipe && y as i32 > Self::panel_bottom(h)) { self.panel = false; return Action::Redraw; }
@@ -234,11 +263,18 @@ impl Shell {
                 if Self::slider_row(sy as i32) == Some(0) { self.brightness = (10.0 + f * 90.0).round() as u8; return Action::Redraw; }
                 if Self::slider_row(sy as i32) == Some(1) { self.volume = (f * VOL_MAX as f64).round() as u8; return Action::Volume(self.volume); }
             }
+            if !swipe && (y as i32 - Self::buttons_y()).abs() < 22 {
+                if (x as i32) < BTN_W + 24 { self.panel = false; self.mode = Mode::Locked; return Action::Redraw; }
+                if (x as i32) < 2 * BTN_W + 40 { self.panel = false; self.open_pin(if self.pin.is_some() { PinStep::Current } else { PinStep::New }); return Action::Redraw; }
+            }
             return Action::None;
         }
         if sy < BAR as f64 && dy > 60.0 && self.mode != Mode::Locked { self.panel = true; return Action::Notifs; }
         if self.mode == Mode::Locked {
-            if swipe && dy < -80.0 { self.mode = Mode::Home; return Action::Redraw; }
+            if swipe && dy < -80.0 {
+                if self.pin.is_some() { self.open_pin(PinStep::Unlock) } else { self.mode = Mode::Home }
+                return Action::Redraw;
+            }
             return Action::None;
         }
         if self.mode == Mode::Home && swipe && dx.abs() > dy.abs() {
@@ -250,6 +286,87 @@ impl Shell {
         }
         if swipe { return Action::None; }
         self.tap(x as i32, y as i32, w, h)
+    }
+
+    fn buttons_y() -> i32 { Self::slider_y(1) + 52 }
+
+    fn open_pin(&mut self, step: PinStep) {
+        self.pin_step = Some(step);
+        self.pin_input.clear();
+        self.pin_msg = match step { PinStep::Unlock | PinStep::Current => "Digite o PIN", PinStep::New => "Novo PIN (4 a 8 dígitos)", PinStep::Confirm => "Confirme o novo PIN" };
+    }
+
+    /// Centro da tecla `i` (0-8 = 1-9, 9 = ⌫, 10 = 0, 11 = OK).
+    fn key_center(i: i32, w: usize, h: usize) -> (i32, i32) {
+        let (top, bottom) = Self::content(h);
+        let y0 = (top + bottom) / 2 - KEY_GAP * 3 / 2 + 50;
+        (w as i32 / 2 + (i % 3 - 1) * KEY_GAP, y0 + i / 3 * KEY_GAP)
+    }
+
+    fn pin_tap(&mut self, x: i32, y: i32, w: usize, h: usize) -> Action {
+        let step = self.pin_step.unwrap();
+        // Voltar/Início na barra de navegação cancelam a troca (desbloqueio não tem como pular)
+        if y >= h as i32 - NAV as i32 {
+            if step != PinStep::Unlock { self.pin_step = None; self.pin_input.clear(); self.pin_new.clear(); return Action::Redraw; }
+            return Action::None;
+        }
+        let Some(k) = (0..12).find(|&i| { let (cx, cy) = Self::key_center(i, w, h); (x - cx).abs() <= KEY / 2 && (y - cy).abs() <= KEY / 2 }) else { return Action::None };
+        if self.pin_wait_until.is_some_and(|t| std::time::Instant::now() < t) { self.pin_msg = "Muitas tentativas: aguarde"; return Action::Redraw; }
+        match k {
+            9 => { self.pin_input.pop(); }
+            11 => return self.pin_ok(step),
+            _ if self.pin_input.len() < PIN_MAX => self.pin_input.push(char::from(b'0' + if k == 10 { 0 } else { k as u8 + 1 })),
+            _ => {}
+        }
+        Action::Redraw
+    }
+
+    fn pin_ok(&mut self, step: PinStep) -> Action {
+        let input = std::mem::take(&mut self.pin_input);
+        if input.len() < PIN_MIN { self.pin_input = input; self.pin_msg = "Mínimo de 4 dígitos"; return Action::Redraw; }
+        match step {
+            PinStep::Unlock | PinStep::Current => {
+                if self.pin.as_ref().is_some_and(|p| p.check(&input)) {
+                    self.pin_fails = 0;
+                    if step == PinStep::Unlock { self.pin_step = None; self.mode = Mode::Home } else { self.open_pin(PinStep::New) }
+                } else {
+                    self.pin_fails += 1;
+                    if self.pin_fails >= PIN_TRIES { self.pin_fails = 0; self.pin_wait_until = Some(std::time::Instant::now() + PIN_WAIT); }
+                    self.pin_msg = "PIN incorreto";
+                }
+                Action::Redraw
+            }
+            PinStep::New => { self.pin_new = input; self.open_pin(PinStep::Confirm); Action::Redraw }
+            PinStep::Confirm => {
+                let new = std::mem::take(&mut self.pin_new);
+                if new != input { self.open_pin(PinStep::New); self.pin_msg = "Não confere: digite de novo"; return Action::Redraw; }
+                match crate::pin::Pin::new(&new) {
+                    Ok(p) => { self.pin = Some(p); self.pin_step = None; Action::SavePin }
+                    Err(_) => { self.pin_step = None; Action::Redraw }
+                }
+            }
+        }
+    }
+
+    fn draw_pin(&mut self, c: &mut Canvas) {
+        let (w, h) = (c.w, c.h);
+        let (top, bottom) = Self::content(h);
+        c.gradient(top as usize, bottom as usize, 0xff0b_1a2e, 0xff1d_3b4f);
+        let (_, y1) = Self::key_center(0, w, h);
+        let mw = self.font.width(self.pin_msg, 20);
+        self.font.draw(c, (w as i32 - mw) / 2, y1 - 110, 20, FG, self.pin_msg);
+        let n = self.pin_input.len() as i32;
+        for i in 0..n.max(PIN_MIN as i32) {
+            let x = w as i32 / 2 + (i * 2 - n.max(PIN_MIN as i32) + 1) * 14 - 6;
+            c.rounded(x, y1 - 80, 12, 12, 6, if i < n { FG } else { 0xff4a_5866 });
+        }
+        for i in 0..12 {
+            let (cx, cy) = Self::key_center(i, w, h);
+            c.rounded(cx - KEY / 2, cy - KEY / 2, KEY, KEY, KEY / 2, 0xff24_3a52);
+            let label = match i { 9 => "⌫".to_string(), 10 => "0".into(), 11 => "OK".into(), _ => (i + 1).to_string() };
+            let lw = self.font.width(&label, 26);
+            self.font.draw(c, cx - lw / 2, cy + 10, 26, FG, &label);
+        }
     }
 
     fn panel_bottom(h: usize) -> i32 { (h as i32 * 3 / 5).max(BAR as i32 + 300) }
@@ -372,6 +489,7 @@ impl Shell {
             }
         }
         if self.panel { self.draw_panel(c, clock, battery); }
+        if self.pin_step.is_some() { self.draw_pin(c); }
         // barra de status: nome à esquerda, bateria + relógio à direita
         c.rect(0, 0, w as i32, BAR as i32, BG_BAR);
         self.font.draw(c, 12, 22, 15, FG_DIM, "LangeOS");
@@ -417,7 +535,15 @@ impl Shell {
             c.rounded(x0, cy - 4, fx.max(8), 8, 4, 0xff4f_9dde);
             c.rounded(x0 + fx - 10, cy - 10, 20, 20, 10, FG);
         }
-        y = Self::slider_y(1) + 36;
+        let by = Self::buttons_y();
+        let pin_label = if self.pin.is_some() { "Alterar PIN" } else { "Definir PIN" };
+        for (i, label) in ["Bloquear", pin_label].into_iter().enumerate() {
+            let x = 24 + i as i32 * (BTN_W + 16);
+            c.rounded(x, by - 18, BTN_W, 36, 18, 0xff2a_3442);
+            let lw = self.font.width(label, 15);
+            self.font.draw(c, x + (BTN_W - lw) / 2, by + 6, 15, FG, label);
+        }
+        y = by + 30;
         if self.notifs.is_empty() {
             self.font.draw(c, 24, y + 24, 17, FG_DIM, "Sem notificações");
         }
@@ -581,6 +707,47 @@ mod tests {
     }
 
     #[test]
+    fn pin_flow() {
+        let (w, h) = (1280, 800);
+        let mut s = Shell::new();
+        let key = |s: &mut Shell, i: i32| { let (x, y) = Shell::key_center(i, w, h); s.touch_down(x as f64, y as f64); s.touch_up(x as f64, y as f64, w, h) };
+        let type_pin = |s: &mut Shell, digits: &str| -> Action {
+            for d in digits.bytes() { let i = if d == b'0' { 10 } else { (d - b'1') as i32 }; key(s, i); }
+            key(s, 11)
+        };
+        // sem PIN: painel -> Definir PIN -> novo + confirmação
+        s.mode = Mode::Home;
+        s.panel = true;
+        let by = Shell::buttons_y() as f64;
+        s.touch_down(24.0 + BTN_W as f64 + 30.0, by);
+        assert_eq!(s.touch_up(24.0 + BTN_W as f64 + 30.0, by, w, h), Action::Redraw);
+        assert_eq!(s.pin_step, Some(PinStep::New));
+        assert_eq!(type_pin(&mut s, "123"), Action::Redraw); // curto demais
+        assert_eq!(s.pin_step, Some(PinStep::New));
+        s.pin_input.clear();
+        type_pin(&mut s, "2580");
+        assert_eq!(type_pin(&mut s, "2580"), Action::SavePin);
+        assert!(s.pin.is_some() && s.pin_step.is_none());
+        // bloqueio: deslizar abre o teclado; PIN errado não entra, certo entra
+        s.mode = Mode::Locked;
+        s.touch_down(600.0, 600.0);
+        s.touch_up(600.0, 300.0, w, h);
+        assert_eq!(s.pin_step, Some(PinStep::Unlock));
+        assert!(s.wants_touch());
+        type_pin(&mut s, "1111");
+        assert_eq!(s.mode, Mode::Locked);
+        type_pin(&mut s, "2580");
+        assert_eq!(s.mode, Mode::Home);
+        assert!(s.pin_step.is_none());
+        // 5 erros: espera, mesmo com o PIN certo
+        s.mode = Mode::Locked;
+        s.open_pin(PinStep::Unlock);
+        for _ in 0..PIN_TRIES { type_pin(&mut s, "0000"); }
+        type_pin(&mut s, "2580");
+        assert_eq!(s.mode, Mode::Locked);
+    }
+
+    #[test]
     fn dates_and_notifs() {
         assert_eq!(format_date(0), "qui, 1 jan 1970");
         assert_eq!(format_date(20_784), "sex, 27 nov 2026");
@@ -598,9 +765,10 @@ mod tests {
         s.apps = parse_apps("ok com.android.settings/.Settings com.android.gallery3d/.app.GalleryActivity com.android.calendar/.AllInOneActivity org.lineageos.jelly/.MainActivity com.android.contacts/.Main com.android.deskclock/.DeskClock org.lineageos.eleven/.Main com.android.documentsui/.Launcher org.lineageos.etar/.Main com.android.camera2/.Camera").unwrap();
         s.recents = vec!["com.android.gallery3d/.app.GalleryActivity".into(), "com.android.settings/.Settings".into()];
         s.notifs = vec![("Atualização do sistema".into(), "LangeOS 0.1 pronto para instalar".into()), ("Agenda".into(), "Reunião às 15:00".into())];
-        for (m, panel, name) in [(Mode::Home, false, "home"), (Mode::Recents, false, "recents"), (Mode::Locked, false, "locked"), (Mode::Home, true, "panel")] {
+        for (m, panel, name) in [(Mode::Home, false, "home"), (Mode::Recents, false, "recents"), (Mode::Locked, false, "locked"), (Mode::Home, true, "panel"), (Mode::Locked, false, "pin")] {
             s.mode = m;
             s.panel = panel;
+            if name == "pin" { s.open_pin(PinStep::Unlock); s.pin_input = "25".into(); } else { s.pin_step = None; }
             let mut px = vec![0u32; w * h];
             s.draw(&mut Canvas { px: &mut px, w, h }, "10:42", Some(76));
             let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
