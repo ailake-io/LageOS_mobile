@@ -14,5 +14,9 @@ for want in "langedroid] open -> ok state=running" "init: init second stage star
 done
 grep -q "Kernel panic" build/boot.log && { echo "FALHOU: kernel panic"; fail=1; }
 grep -qE 'init: Reboot start|InitFatalReboot' build/boot.log && { echo "FALHOU: Android pediu reboot: $(grep -oE "Reboot start, reason: [^,]*|critical process '[^']+'" build/boot.log | head -1)"; fail=1; }
+# progresso (informativo)
+echo "surfaceflinger iniciado: $(grep -ac "starting service 'surfaceflinger'" build/boot.log)x" \
+     "| system_server: $(grep -aqE 'Entered the Android system server' build/boot.log && echo sim || echo não)" \
+     "| boot completo: $(grep -aqE 'sys.boot_completed|Boot is finished|BOOT_COMPLETED' build/boot.log && echo sim || echo não)"
 [ $fail -eq 0 ] && echo PASSOU || { echo "--- últimas linhas init/langedroid ---"; grep -E 'init:|langedroid|\[init\]' build/boot.log | tail -25; }
 exit $fail

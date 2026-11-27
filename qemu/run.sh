@@ -28,11 +28,14 @@ if [ -n "${ANDROID:-}" ]; then
   # vdc/vdd/vde (ordem de enumeração invertida: ver comentário no qemu abaixo)
   DISKS=(-drive file=$A/data.img,format=raw,if=none,id=adata -device virtio-blk-device,drive=adata
          -drive file=$A/vendor.img,format=raw,if=none,id=avendor,readonly=on -device virtio-blk-device,drive=avendor
-         -drive file=$A/system.img,format=raw,if=none,id=asys,readonly=on -device virtio-blk-device,drive=asys)
+         -drive file=$A/system.img,format=raw,if=none,id=asys,readonly=on -device virtio-blk-device,drive=asys
+         -device virtio-gpu-device)  # GPU 2D: Mesa renderiza por software (llvmpipe/kms_swrast)
   printf '/dev/vdc /android/root ext4 ro\n/dev/vdd /android/root/vendor ext4 ro\n/dev/vde /android/root/data ext4 rw\n' >> "$R/etc/lange/fstab"
   # 1º estágio do init Android (mknod /dev, fstab) é trabalho do host: entra no selinux_setup
   # (carrega a sepolicy do Android, permissiva) que então chama o 2º estágio.
-  printf 'exec=/bin/langedroid daemon --rootfs /android/root --idle-freeze %s %s--payload /system/bin/init selinux_setup\n' "${IDLE_FREEZE:-30}" "${DEBUG_LOGCAT:+--debug-logcat }" > "$S/20-langedroid.svc"
+  # gráficos estilo Waydroid: EGL Mesa + gralloc gbm no render node
+  GFX_PROPS='--prop ro.hardware.egl=mesa --prop ro.hardware.gralloc=gbm --prop gralloc.gbm.device=/dev/dri/renderD128 '
+  printf 'exec=/bin/langedroid daemon --rootfs /android/root --idle-freeze %s %s%s--payload /system/bin/init selinux_setup\n' "${IDLE_FREEZE:-30}" "${DEBUG_LOGCAT:+--debug-logcat }" "$GFX_PROPS" > "$S/20-langedroid.svc"
   printf 'exec=/bin/langedroid ctl open\nrestart=never\n' > "$S/30-android-open.svc"
   MEM=${MEM:-3072}
   CMDLINE_EXTRA="printk.devkmsg=on androidboot.selinux=permissive"  # sem ratelimit: logs do init Android completos
