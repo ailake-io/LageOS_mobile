@@ -20,6 +20,11 @@ Android (LineageOS 20) no container, desenhado pelo `lange-compositor`, no QEMU 
 
 ![Launcher Android no LangeOS](docs/img/android-launcher-qemu.png)
 
+Launcher nativa do LangeOS (apps do container Android, nomes em português) e o app aberto a partir dela:
+
+![Launcher nativa](docs/img/launcher-nativa.png)
+![Galeria aberta pela launcher](docs/img/launcher-abre-galeria.png)
+
 Toque funcionando (tap via virtio-tablet abre o menu do ícone da Galeria; barra de status nativa do LangeOS no topo):
 
 ![Toque no Android](docs/img/android-toque-qemu.png)

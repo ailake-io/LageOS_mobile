@@ -198,40 +198,15 @@ fn import_dmabuf(dmabuf: &Dmabuf, card: Option<&Card>) -> Option<Image> {
     img
 }
 
-// ---------- shell nativo: barra de status ----------
+// ---------- shell nativo (src/shell.rs) ----------
 
-/// Altura da barra de status do LangeOS (desenhada pelo compositor; janelas ficam abaixo).
-const BAR: usize = 32;
-
-/// Fonte 3x5 (bit 2 = coluna esquerda), só dígitos e ':'.
-const FONT: [[u8; 5]; 11] = [
-    [7, 5, 5, 5, 7], [2, 6, 2, 2, 7], [7, 1, 7, 4, 7], [7, 1, 7, 1, 7], [5, 5, 7, 1, 1],
-    [7, 4, 7, 1, 7], [7, 4, 7, 5, 7], [7, 1, 1, 1, 1], [7, 5, 7, 5, 7], [7, 5, 7, 1, 7], [0, 2, 0, 2, 0],
-];
+mod shell;
+use shell::{Action, Canvas, Mode, Shell, BAR, NAV};
 
 /// "HH:MM" UTC. ponytail: sem fuso horário (sem tzdata no rootfs); ler TZ quando houver config de usuário.
 fn clock_now() -> String {
     let s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     format!("{:02}:{:02}", s / 3600 % 24, s / 60 % 60)
-}
-
-fn status_bar(fb: &mut [u32], fw: usize, text: &str) {
-    const SCALE: usize = 4;
-    let n = (BAR * fw).min(fb.len());
-    fb[..n].fill(0xff1c_2430);
-    let x0 = fw.saturating_sub(text.len() * 4 * SCALE + 8);
-    for (i, c) in text.chars().enumerate() {
-        let g = match c { '0'..='9' => FONT[c as usize - '0' as usize], ':' => FONT[10], _ => continue };
-        for (row, bits) in g.iter().enumerate() {
-            for col in 0..3 {
-                if bits >> (2 - col) & 1 == 0 { continue; }
-                for dy in 0..SCALE { for dx in 0..SCALE {
-                    let (x, y) = (x0 + (i * 4 + col) * SCALE + dx, 6 + row * SCALE + dy);
-                    if x < fw && y < BAR { fb[y * fw + x] = 0xffe8_eef4; }
-                } }
-            }
-        }
-    }
 }
 
 // ---------- input: evdev (toque / tablet absoluto) ----------
@@ -422,6 +397,11 @@ struct App {
     start: Instant,
     frame_seq: u64,
     import_time: Duration,
+    shell: Shell,
+    touch_shell: bool,
+    touch_pos: (f64, f64),
+    /// pedidos p/ o langedroid (socket do shell), enviados pela thread `shell_client`
+    requests: Vec<String>,
 }
 
 impl BufferHandler for App { fn buffer_destroyed(&mut self, _b: &wl_buffer::WlBuffer) {} }
@@ -458,7 +438,7 @@ impl XdgShellHandler for App {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState { &mut self.xdg }
     /// Tela cheia: toda janela recebe o tamanho da saída (celular).
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        let (w, h) = (self.size.0, self.size.1 - BAR as i32);
+        let (w, h) = (self.size.0, self.size.1 - (BAR + NAV) as i32);
         surface.with_pending_state(|s| {
             s.size = Some((w, h).into());
             s.states.set(xdg_toplevel::State::Activated);
@@ -563,7 +543,8 @@ impl App {
     /// Android, como coordenadas da janela; com foco numa subsurface (ex.: barra de navegação) o
     /// toque caía no lugar errado.
     fn surface_at(&self, px: f64, py: f64) -> Option<(WlSurface, smithay::utils::Point<f64, smithay::utils::Logical>)> {
-        let (w, h) = (self.size.0 as f64, (self.size.1 - BAR as i32) as f64);
+        if self.shell.mode != Mode::App { return None; }
+        let (w, h) = (self.size.0 as f64, (self.size.1 - (BAR + NAV) as i32) as f64);
         let (x, y) = (px, py - BAR as f64);
         if x < 0.0 || y < 0.0 || x >= w || y >= h { return None; }
         // ponytail: janelas em tela cheia empilhadas; a última criada fica na frente
@@ -577,14 +558,40 @@ impl App {
         self.import_time += t.elapsed();
         screen.fb.fill(0xff10_1418); // fundo LangeOS
         let (fw, fh) = (screen.w, screen.h);
-        for (surf, x, y, dw, dh) in self.layers() {
-            if let Some(img) = self.images.get(&surf.id()) { draw(&mut screen.fb, fw, fh, img, x, y, dw, dh); }
+        if self.shell.mode == Mode::App {
+            // janela Android só entre as barras (ela é configurada com essa altura)
+            let area = &mut screen.fb[..(fh - NAV) * fw];
+            for (surf, x, y, dw, dh) in self.layers() {
+                if let Some(img) = self.images.get(&surf.id()) { draw(area, fw, fh - NAV, img, x, y, dw, dh); }
+            }
         }
-        status_bar(&mut screen.fb, fw, &clock_now());
+        self.shell.draw(&mut Canvas { px: &mut screen.fb, w: fw, h: fh }, &clock_now(), shell::battery());
     }
 
-    /// Evento de toque (coordenadas da tela). Foco fixado no `down`, como no Wayland.
+    /// Toque: barras e tela inicial/recentes são do shell; o resto vai p/ a janela Android.
+    /// Quem recebe é decidido no `down` e vale até o `up`.
     fn touch(&mut self, ev: TouchEv) {
+        let (w, h) = (self.size.0 as usize, self.size.1 as usize);
+        if let TouchEv::Down(x, y) = ev {
+            self.touch_shell = self.surface_at(x, y).is_none();
+            if self.touch_shell { self.shell.touch_down(x, y); }
+            self.touch_pos = (x, y);
+        }
+        if let TouchEv::Motion(x, y) = ev { self.touch_pos = (x, y); }
+        if !self.touch_shell { return self.touch_android(ev); }
+        if ev == TouchEv::Up {
+            let (x, y) = self.touch_pos;
+            match self.shell.touch_up(x, y, w, h) {
+                Action::None => {}
+                Action::Redraw => self.dirty = true,
+                Action::Launch(c) => { self.requests.push(format!("launch {c}")); self.dirty = true; }
+                Action::Key(k) => { self.requests.push(format!("key {k}")); self.dirty = true; }
+            }
+        }
+    }
+
+    /// Evento de toque p/ a janela Android (coordenadas da tela). Foco fixado no `down`, como no Wayland.
+    fn touch_android(&mut self, ev: TouchEv) {
         let Some(t) = self.seat.get_touch() else { return };
         let time = self.start.elapsed().as_millis() as u32;
         // id 0: None vira -1 no wl_touch, e o hwcomposer repassa como ABS_MT_TRACKING_ID -1 (= dedo solto)
@@ -626,6 +633,31 @@ impl App {
             );
         }
     }
+}
+
+/// Socket do shell no langedroid (só uid 600 = este compositor).
+const SHELL_SOCK: &str = "/run/langedroid-shell.sock";
+
+/// Thread que fala com o langedroid: comandos podem levar segundos (container lento no QEMU) e o
+/// loop do compositor não pode parar. Uma conexão por pedido; resposta = (pedido, linha).
+fn shell_client() -> (std::sync::mpsc::Sender<String>, std::sync::mpsc::Receiver<(String, String)>) {
+    let (req_tx, req_rx) = std::sync::mpsc::channel::<String>();
+    let (resp_tx, resp_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::{BufRead, Write};
+        for req in req_rx {
+            let reply = (|| -> std::io::Result<String> {
+                let s = std::os::unix::net::UnixStream::connect(SHELL_SOCK)?;
+                s.set_read_timeout(Some(Duration::from_secs(60)))?;
+                writeln!(&s, "{req}")?;
+                let mut line = String::new();
+                std::io::BufReader::new(&s).read_line(&mut line)?;
+                Ok(line.trim().to_string())
+            })().unwrap_or_else(|e| format!("erro {e}"));
+            if resp_tx.send((req, reply)).is_err() { break; }
+        }
+    });
+    (req_tx, resp_rx)
 }
 
 fn parse_size(s: &str) -> Option<(usize, usize)> {
@@ -687,6 +719,10 @@ fn main() {
         start: Instant::now(),
         frame_seq: 0,
         import_time: Duration::ZERO,
+        shell: Shell::new(),
+        touch_shell: false,
+        touch_pos: (0.0, 0.0),
+        requests: Vec::new(),
     };
     
     if let Some(dir) = std::path::Path::new(&socket).parent() { let _ = fs::create_dir_all(dir); }
@@ -710,6 +746,9 @@ fn main() {
     eprintln!("[compositor] pronto em {socket} ({}x{})", screen.w, screen.h);
 
     let mut minute = clock_now();
+    let (req_tx, resp_rx) = shell_client();
+    // lista de apps: pede até o Android responder (boot leva minutos no QEMU)
+    let (mut apps_asked, mut apps_pending) = (Instant::now() - Duration::from_secs(60), false);
     // diagnóstico do toque (android/test-android.sh): quadro antes do 1º toque e ~4 s após soltar
     let (mut pre_touch_saved, mut post_touch_at) = (false, None::<Instant>);
     // estatística a cada 10 s: commits recebidos, quadros desenhados, tempo médio de render
@@ -726,7 +765,7 @@ fn main() {
             PollFd { fd: display.backend().poll_fd().as_raw_fd(), events: POLLIN, revents: 0 },
             PollFd { fd: tablet.as_ref().map_or(-1, |t| t.file.as_raw_fd()), events: POLLIN, revents: 0 },
         ];
-        unsafe { poll(fds.as_mut_ptr(), fds.len() as _, if app.dirty { until_frame.max(1) } else { 1000 }) };
+        unsafe { poll(fds.as_mut_ptr(), fds.len() as _, if app.dirty { until_frame.max(1) } else { 200 }) };
 
         while let Ok(Some(stream)) = listener.accept() {
             if let Ok(c) = display.handle().insert_client(stream, Arc::new(ClientState::default())) { clients.push(c); }
@@ -746,6 +785,36 @@ fn main() {
             }
         }
         if clock_now() != minute { minute = clock_now(); app.dirty = true; }
+        // vazia: a cada 15 s; depois a cada 60 s (no boot só aparecem apps direct-boot; instalações novas)
+        let every = if app.shell.apps.is_empty() { 15 } else { 60 };
+        if !apps_pending && apps_asked.elapsed() >= Duration::from_secs(every) {
+            apps_asked = Instant::now();
+            apps_pending = req_tx.send("apps".into()).is_ok();
+        }
+        for r in app.requests.drain(..) { let _ = req_tx.send(r); }
+        while let Ok((req, reply)) = resp_rx.try_recv() {
+            if req == "apps" {
+                apps_pending = false;
+                match shell::parse_apps(&reply) {
+                    Some(apps) if !apps.is_empty() && apps != app.shell.apps => {
+                        eprintln!("[compositor] {} apps", apps.len());
+                        app.shell.apps = apps;
+                        // posição de cada ícone (testes automáticos tocam por aqui)
+                        for (a, (x, y, w, h)) in app.shell.apps.iter().zip(app.shell.grid(screen.w, screen.h)) {
+                            eprintln!("[compositor] icone {} {} {}", a.label, x + w / 2, y + h / 2);
+                        }
+                        app.dirty = true;
+                    }
+                    Some(_) => {}
+                    None => eprintln!("[compositor] apps: {}", reply.chars().take(120).collect::<String>()),
+                }
+            } else if req == "key back" && reply == "ok home" {
+                app.shell.mode = Mode::Home; // saiu do app: tela inicial nativa, não a launcher do Android
+                app.dirty = true;
+            } else if reply.starts_with("erro") {
+                eprintln!("[compositor] {req}: {reply}");
+            }
+        }
         // ponytail: sem vblank; quadro no máximo a cada FRAME (limita o custo do readback no QEMU)
         if app.dirty && last_frame.elapsed() >= FRAME {
             app.dirty = false;
@@ -833,13 +902,6 @@ mod tests {
                   ev(EV_ABS, 1, 32767), ev(EV_SYN, 0, 0), ev(EV_KEY, BTN_LEFT, 0), ev(EV_SYN, 0, 0),
                   ev(EV_ABS, 0, 1), ev(EV_SYN, 0, 0)] { t.feed(&e, 720, 1280, &mut out); }
         assert_eq!(out, [TouchEv::Down(360.0, 0.0), TouchEv::Motion(360.0, 1279.9609375), TouchEv::Up]); // movimento sem toque: nada
-    }
-    #[test]
-    fn bar_clock() {
-        let mut fb = vec![0u32; 200 * BAR];
-        status_bar(&mut fb, 200, "12:34");
-        assert!(fb.iter().all(|&p| p == 0xff1c_2430 || p == 0xffe8_eef4));
-        assert!(fb.iter().filter(|&&p| p == 0xffe8_eef4).count() > 50);
     }
     #[test]
     fn size_arg() { assert_eq!(parse_size("720x1280"), Some((720, 1280))); assert_eq!(parse_size("x"), None); }

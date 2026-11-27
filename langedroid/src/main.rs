@@ -7,6 +7,8 @@
 //!     --prop K=V: sobrepõe propriedade no vendor/build.prop (repetível)
 //!     --debug-logcat: logcat do Android inteiro em /dev/kmsg (console do host). Só p/ depuração.
 //!   langedroid ctl <open|close|freeze|thaw|status|stop>         cliente
+//!   Socket do shell (/run/langedroid-shell.sock, uid 600 = lange-compositor): só `apps`,
+//!   `launch PACOTE/ATIVIDADE`, `key back|home`. Nada de exec arbitrário no container.
 //!   langedroid selftest                                          teste ponta a ponta contra o daemon
 //!
 //! Container = payload em namespaces novos (pid, mount, uts, ipc, net) dentro de /sys/fs/cgroup/android.
@@ -18,6 +20,9 @@ use std::time::{Duration, Instant};
 use std::{env, fs, thread};
 
 const SOCK: &str = "/run/langedroid.sock";
+const SHELL_SOCK: &str = "/run/langedroid-shell.sock";
+/// uid do lange-compositor (ver COMPOSITOR_UID lá)
+const SHELL_UID: u32 = 600;
 const CG: &str = "/sys/fs/cgroup/android";
 
 unsafe extern "C" {
@@ -34,6 +39,10 @@ unsafe extern "C" {
     fn chdir(path: *const u8) -> i32;
     fn syscall(n: i64, ...) -> i64;
     fn mknod(path: *const u8, mode: u32, dev: u64) -> i32;
+    fn setns(fd: i32, nstype: i32) -> i32;
+    fn kill(pid: i32, sig: i32) -> i32;
+    fn chroot(path: *const u8) -> i32;
+    fn fchdir(fd: i32) -> i32;
 }
 const CLONE_NEWNS: i32 = 0x0002_0000;
 const CLONE_NEWUTS: i32 = 0x0400_0000;
@@ -222,6 +231,7 @@ fn enter_rootfs(root: &str, binds: &[(String, String)], wayland_dir: Option<&str
         mnt("tmpfs", &format!("{root}/run"), "tmpfs", MS_NOSUID, "mode=0755")?;
         let user = format!("{root}/run/user/1000");
         fs::create_dir_all(&user)?;
+        fs::create_dir_all(w)?; // compositor pode ainda não ter criado (serviços sobem em paralelo)
         mnt(w, &user, "", MS_BIND, "")?;
         // read-only: o container conecta no socket (sockets ignoram ro) mas não pode trocá-lo
         mnt("none", &user, "", MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, "")?;
@@ -376,6 +386,90 @@ impl Container {
         match r { Ok(()) => format!("ok {}", self.status()), Err(e) => format!("erro {e}") }
     }
 
+    /// PID 1 do container (filho do processo intermediário).
+    fn android_init(&self) -> Option<u32> {
+        let p = self.child.as_ref()?.id();
+        fs::read_to_string(format!("/proc/{p}/task/{p}/children")).ok()?.split_whitespace().next()?.parse().ok()
+    }
+
+    /// Roda /system/bin/cmd ARGS dentro do container (mount/net/ipc/uts do init Android + chroot).
+    /// `cmd` fala binder direto com o serviço (activity, package, input): sem app_process/env do Android.
+    fn android_cmd(&self, args: &[&str]) -> Result<String, String> { self.android_run("/system/bin/cmd", args) }
+
+    /// Programa fixo do sistema Android (cmd, dumpsys) dentro do container.
+    fn android_run(&self, prog: &str, args: &[&str]) -> Result<String, String> {
+        if self.state != State::Running { return Err("container não está rodando".into()); }
+        let init = self.android_init().ok_or("sem init do container")?;
+        let open = |n: &str| fs::File::open(format!("/proc/{init}/{n}")).map_err(|e| format!("{n}: {e}"));
+        let ns: Vec<fs::File> = ["ns/ipc", "ns/uts", "ns/net", "ns/pid", "ns/mnt"].iter().map(|n| open(n)).collect::<Result<_, _>>()?;
+        let root = open("root")?;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        let (fds, rootfd): (Vec<i32>, i32) = (ns.iter().map(|f| f.as_raw_fd()).collect(), root.as_raw_fd());
+        let mut cmd = Command::new(prog);
+        cmd.args(args).env_clear().env("PATH", "/system/bin").stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        unsafe {
+            cmd.pre_exec(move || {
+                for &fd in &fds { if setns(fd, 0) != 0 { return Err(std::io::Error::last_os_error()); } }
+                // setns(pid) só vale p/ filhos: bifurca. Sem isso /proc/self (do /proc do container) não
+                // existe p/ este processo e o linker do Android aborta. Intermediário repassa o status.
+                let pid = fork();
+                if pid < 0 { return Err(std::io::Error::last_os_error()); }
+                if pid > 0 {
+                    let mut st = 0;
+                    waitpid(pid, &mut st, 0);
+                    _exit(if st & 0x7f == 0 { (st >> 8) & 0xff } else { 128 + (st & 0x7f) });
+                }
+                if fchdir(rootfd) != 0 || chroot(b".\0".as_ptr()) != 0 || chdir(b"/\0".as_ptr()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            })
+        };
+        let child = cmd.spawn().map_err(|e| format!("spawn cmd: {e}"))?;
+        // Lê a saída enquanto roda (pipe de 64 KB enchia e o cmd travava escrevendo). Trava = mata:
+        // QEMU é lento, aparelho real responde em ms.
+        let pid = child.id() as i32;
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d = done.clone();
+        thread::spawn(move || {
+            let t = Instant::now();
+            while !d.load(std::sync::atomic::Ordering::Relaxed) {
+                if t.elapsed() > Duration::from_secs(30) { unsafe { kill(pid, 9) }; break; }
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let out = child.wait_with_output().map_err(|e| e.to_string());
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let out = out?;
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        if out.status.success() { Ok(text) } else { Err(format!("cmd {}: {}", out.status, String::from_utf8_lossy(&out.stderr).trim())) }
+    }
+
+    /// Comandos do shell (compositor). Resposta: "ok ..." ou "erro ...".
+    fn handle_shell(&mut self, line: &str) -> String {
+        let (verb, arg) = line.split_once(' ').unwrap_or((line, ""));
+        let r = match verb {
+            "apps" => self.android_cmd(&["package", "query-activities", "--brief", "-a", "android.intent.action.MAIN", "-c", "android.intent.category.LAUNCHER"])
+                .map(|out| launcher_components(&out).join(" ")),
+            "launch" if valid_component(arg) => self.android_cmd(&["activity", "start-activity", "-n", arg]).map(|_| String::new()),
+            "key" => match arg {
+                // Voltar na 1ª tela do app leva p/ a launcher do Android: avisa o shell ("home") p/ ele
+                // mostrar a tela inicial nativa no lugar.
+                "back" => self.android_cmd(&["input", "keyevent", "4"]).map(|_| {
+                    thread::sleep(Duration::from_millis(800));
+                    let top = self.android_run("/system/bin/dumpsys", &["activity", "activities"]).unwrap_or_default();
+                    if top_is_home(&top) { "home".into() } else { String::new() }
+                }),
+                "home" => self.android_cmd(&["input", "keyevent", "3"]).map(|_| String::new()),
+                _ => Err("tecla desconhecida".into()),
+            },
+            _ => Err(format!("comando do shell inválido: {line}")),
+        };
+        match r { Ok(v) => format!("ok {v}").trim_end().to_string(), Err(e) => format!("erro {e}") }
+    }
+
     /// Timer de ociosidade + detecção de container que morreu sozinho.
     fn tick(&mut self) {
         if let Some(c) = &mut self.child && matches!(c.try_wait(), Ok(Some(_))) {
@@ -422,38 +516,67 @@ fn daemon(args: &[String]) {
         }
     }
     if payload.is_empty() { payload = vec![if rootfs.is_some() { "/init" } else { "/bin/droid-payload" }.to_string()]; }
-    let _ = fs::remove_file(SOCK);
-    // Socket de controle só p/ root: quem fala com ele controla o container.
-    // umask antes do bind: o socket já nasce 0600 (sem janela entre bind e chmod).
-    let old = unsafe { umask(0o177) };
-    let l = UnixListener::bind(SOCK).unwrap_or_else(|e| { eprintln!("[langedroid] bind {SOCK}: {e}"); std::process::exit(1) });
-    unsafe { umask(old) };
-    use std::os::unix::fs::PermissionsExt;
-    if let Err(e) = fs::set_permissions(SOCK, fs::Permissions::from_mode(0o600)) {
-        eprintln!("[langedroid] chmod {SOCK}: {e}"); std::process::exit(1);
-    }
-    l.set_nonblocking(true).unwrap();
+    // Socket de controle só p/ root: quem fala com ele controla o container. umask antes do bind:
+    // nasce 0600 (sem janela entre bind e chmod). Shell (compositor) tem socket próprio e restrito.
+    let l = bind_private(SOCK, 0);
+    let shell = bind_private(SHELL_SOCK, SHELL_UID);
     let mut c = Container { payload, rootfs, wayland_dir, abi64, debug_logcat, props, child: None, fifos: Vec::new(), state: State::Stopped, idle_freeze: Duration::from_secs(idle), close_at: None };
     eprintln!("[langedroid] pronto em {SOCK} (cold start sob demanda, freeze após {idle}s ocioso)");
     loop {
-        match l.accept() {
-            Ok((s, _)) => {
-                // defesa em profundidade além do 0600: só aceita peer root
-                if peer_uid(&s) != Some(0) { eprintln!("[langedroid] conexão recusada: uid {:?}", peer_uid(&s)); continue; }
-                let _ = s.set_nonblocking(false);
-                let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
-                let mut line = String::new();
-                if BufReader::new(&s).read_line(&mut line).is_ok() && !line.trim().is_empty() {
-                    let reply = c.handle(line.trim());
-                    eprintln!("[langedroid] {} -> {reply}", line.trim());
-                    let _ = writeln!(&s, "{reply}");
-                }
-            }
-            // ponytail: polling 100ms; trocar por epoll+timerfd quando medir bateria
-            Err(_) => thread::sleep(Duration::from_millis(100)),
-        }
+        // defesa em profundidade além do 0600: confere o uid do peer
+        let a = serve_one(&l, 0, &mut |cmd| c.handle(cmd));
+        // ponytail: comando do shell roda síncrono (segundos no QEMU) e segura o loop; thread se incomodar
+        let b = serve_one(&shell, SHELL_UID, &mut |cmd| c.handle_shell(cmd));
+        // ponytail: polling 100ms; trocar por epoll+timerfd quando medir bateria
+        if !a && !b { thread::sleep(Duration::from_millis(100)); }
         c.tick();
     }
+}
+
+/// Componentes (pacote/atividade) da saída de `cmd package query-activities --brief`.
+fn launcher_components(out: &str) -> Vec<String> {
+    let mut v: Vec<String> = out.lines().map(str::trim).filter(|l| valid_component(l)).map(String::from).collect();
+    v.dedup();
+    v
+}
+
+/// `dumpsys activity activities`: a atividade no topo é a launcher do Android (HOME)?
+fn top_is_home(dump: &str) -> bool {
+    dump.lines().find(|l| l.contains("topResumedActivity=") || l.contains("mResumedActivity:"))
+        .is_some_and(|l| l.contains("launcher") || l.contains("FallbackHome"))
+}
+
+/// pacote/atividade só com [A-Za-z0-9._$/]: nada de espaço/opção vindo do cliente vira argumento do cmd.
+fn valid_component(s: &str) -> bool {
+    let Some((pkg, act)) = s.split_once('/') else { return false };
+    !pkg.is_empty() && !act.is_empty() && !s.starts_with('-')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || "._$/".contains(c)) && s.matches('/').count() == 1
+}
+
+/// Socket com dono `uid`, modo 0600 desde o bind (umask).
+fn bind_private(path: &str, uid: u32) -> UnixListener {
+    let _ = fs::remove_file(path);
+    let old = unsafe { umask(0o177) };
+    let l = UnixListener::bind(path).unwrap_or_else(|e| { eprintln!("[langedroid] bind {path}: {e}"); std::process::exit(1) });
+    unsafe { umask(old) };
+    if let Err(e) = std::os::unix::fs::chown(path, Some(uid), Some(uid)) { eprintln!("[langedroid] chown {path}: {e}"); std::process::exit(1); }
+    l.set_nonblocking(true).unwrap();
+    l
+}
+
+/// Lê uma linha do cliente, responde e loga. `allowed` = uid aceito (além do 0600 do socket).
+fn serve_one(l: &UnixListener, allowed: u32, f: &mut dyn FnMut(&str) -> String) -> bool {
+    let Ok((s, _)) = l.accept() else { return false };
+    if peer_uid(&s) != Some(allowed) { eprintln!("[langedroid] conexão recusada: uid {:?}", peer_uid(&s)); return true; }
+    let _ = s.set_nonblocking(false);
+    let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+    let mut line = String::new();
+    if BufReader::new(&s).read_line(&mut line).is_ok() && !line.trim().is_empty() {
+        let reply = f(line.trim());
+        eprintln!("[langedroid] {} -> {}", line.trim(), reply.chars().take(200).collect::<String>());
+        let _ = writeln!(&s, "{reply}");
+    }
+    true
 }
 
 /// uid do processo do outro lado (SO_PEERCRED; struct ucred = pid, uid, gid).
@@ -513,6 +636,22 @@ fn selftest() -> bool {
     step("stop", "stop", "stopped", 1);
     eprintln!("[selftest] {}", if ok.get() { "TUDO PASSOU" } else { "FALHOU" });
     ok.get()
+}
+
+#[cfg(test)]
+mod shell_tests {
+    use super::*;
+    #[test]
+    fn components() {
+        let out = "priority=0 preferredOrder=0\n  com.android.calendar/.AllInOneActivity\n  org.lineageos.jelly/.MainActivity\n";
+        assert_eq!(launcher_components(out), ["com.android.calendar/.AllInOneActivity", "org.lineageos.jelly/.MainActivity"]);
+        assert!(!valid_component("-n x/y"));
+        assert!(!valid_component("a/b c"));
+        assert!(!valid_component("a/b/c"));
+        assert!(valid_component("com.x/com.x.Main$Inner"));
+        assert!(top_is_home("  x\n      topResumedActivity=ActivityRecord{6fa u0 com.android.launcher3/.uioverrides.QuickstepLauncher} t6}"));
+        assert!(!top_is_home("      topResumedActivity=ActivityRecord{6fa u0 com.android.gallery3d/.app.GalleryActivity t7}"));
+    }
 }
 
 fn main() {

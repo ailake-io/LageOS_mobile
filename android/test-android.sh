@@ -13,9 +13,13 @@ qpid=$!
 # virtio-tablet e compara screendumps do QEMU antes/depois.
 touched=
 while kill -0 $qpid 2>/dev/null; do
-  if grep -aqE 'processing action \(sys.boot_completed=1\)' build/boot.log; then
-    sleep 150  # QEMU: Launcher sobe ~100 s após boot_completed e é relançada (config: touchscreen novo)
-    python3 qmp.py "$Q" tap 0.457 0.906 && touched=1  # centro do ícone da Galeria na Launcher
+  # launcher nativa recebeu a lista de apps do Android (langedroid `apps`)
+  icon=$(grep -aoE 'compositor\] icone Galeria [0-9]+ [0-9]+' build/boot.log | head -1)
+  if [ -n "$icon" ]; then
+    sleep 20
+    read -r _ _ _ x y <<<"$icon"
+    # coordenadas em fração da tela (1280x800 no QEMU)
+    python3 qmp.py "$Q" tap "$(python3 -c "print($x/1280)")" "$(python3 -c "print($y/800)")" && touched=1
     sleep 30  # compositor grava screen-post-touch.ppm 20 s após soltar (com fsync) + commit do ext4
     python3 qmp.py "$Q" quit 2>/dev/null; break
   fi
@@ -53,6 +57,7 @@ a=open('build/touch-pre.ppm','rb').read(); b=open('build/touch-post.ppm','rb').r
 assert a[:2]==b[:2]==b'P6' and len(a)==len(b)
 n=min(len(a),len(b))//3; print(sum(1 for i in range(0,n*3,3) if a[i:i+3]!=b[i:i+3])*100//max(n,1))" 2>/dev/null || echo 0)
   python3 ppm2png.py build/touch-post.ppm build/touch-post.png 2>/dev/null
+  grep -aq 'launch com.android.gallery3d/[^ ]* -> ok' build/boot.log && echo "OK    launcher nativa abriu a Galeria (langedroid launch)" || { echo "FALTA launcher nativa abrir a Galeria"; fail=1; }
   [ "$touch_diff" -ge 2 ] && echo "OK    toque muda a tela (${touch_diff}% mudou; android/build/touch-post.png)" || { echo "FALTA toque muda a tela (${touch_diff}% mudou)"; fail=1; }
 else echo "FALTA teste de toque (boot não completou)"; fail=1; fi
 # progresso (informativo)

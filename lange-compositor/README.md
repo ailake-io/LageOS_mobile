@@ -9,7 +9,7 @@ lange-compositor [--socket /run/lange/wayland-0] [--size LxA] [--screenshot ARQ.
 - Saída: `/dev/dri/card0` (primeiro conector conectado, primeiro modo). Sem DRM: headless em memória.
 - Protocolos: compositor + subcompositor, xdg_shell, shm, linux-dmabuf (linear, 1 plano), viewporter, presentation, output. Cobre o hwcomposer do Waydroid (container LangeDroid).
 - Janelas: tela cheia, empilhadas; subsurfaces posicionadas; viewporter = escala vizinho-mais-próximo; blend alfa pré-multiplicado.
-- Shell nativo: barra de status de 32 px (relógio HH:MM) desenhada pelo compositor; janelas ficam abaixo dela.
+- Shell nativo (`src/shell.rs`): barra de status (LangeOS, bateria, relógio), barra de navegação (voltar, início, recentes), tela inicial com a grade de apps do Android e recentes. Texto com `fontdue` + DejaVu Sans (`assets/`, licença livre). Apps via `/run/langedroid-shell.sock` (`apps`, `launch`, `key`) numa thread. Preview sem QEMU: `SHELL_PREVIEW=/tmp/x cargo test -- --ignored preview`.
 - Toque: primeiro `/dev/input/event*` com eixos absolutos (virtio-tablet no QEMU) vira `wl_touch` no `wl_seat` "seat0", focado na superfície mais à frente sob o dedo.
 - Privilégios: abre DRM, input e socket como root e então larga para uid/gid 600 (socket `600:1000 0660`).
 - `wp_presentation`: responde `presented` a cada quadro (sem isso o SurfaceFlinger para de mandar quadros).
