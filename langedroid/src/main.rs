@@ -283,7 +283,7 @@ fn hold_input_fifos(pid: u32) -> Vec<fs::File> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum State { Stopped, Running, Frozen }
 
-struct Container { payload: Vec<String>, rootfs: Option<String>, wayland_dir: Option<String>, abi64: bool, debug_logcat: bool, props: Vec<(String, String)>, child: Option<Child>, fifos: Vec<fs::File>, state: State, idle_freeze: Duration, close_at: Option<Instant> }
+struct Container { payload: Vec<String>, rootfs: Option<String>, wayland_dir: Option<String>, abi64: bool, debug_logcat: bool, props: Vec<(String, String)>, child: Option<Child>, fifos: Vec<fs::File>, android_setup_done: bool, state: State, idle_freeze: Duration, close_at: Option<Instant> }
 
 fn cg(file: &str) -> String { format!("{CG}/{file}") }
 
@@ -367,6 +367,7 @@ impl Container {
         let _ = fs::write(cg("cgroup.kill"), "1"); // mata container inteiro, inclusive o PID 1 dele
         if let Some(mut c) = self.child.take() { let _ = c.wait(); }
         self.fifos.clear();
+        self.android_setup_done = false;
         let _ = fs::write(cg("cgroup.freeze"), "0");
         self.state = State::Stopped;
         self.close_at = None;
@@ -472,12 +473,26 @@ impl Container {
         }
     }
 
+    /// Ajustes do Android p/ o shell do LangeOS, uma vez por boot (quando o Android já responde).
+    fn android_setup(&mut self) {
+        // O FIFO wl_keyboard_events do Waydroid aparece como teclado físico e o Android esconderia o
+        // teclado virtual; num celular ele precisa aparecer sempre.
+        match self.android_cmd(&["settings", "put", "secure", "show_ime_with_hard_keyboard", "1"]) {
+            Ok(_) => { self.android_setup_done = true; eprintln!("[langedroid] android: teclado virtual sempre visível"); }
+            Err(e) => eprintln!("[langedroid] android setup: {e}"),
+        }
+    }
+
     /// Comandos do shell (compositor). Resposta: "ok ..." ou "erro ...".
     fn handle_shell(&mut self, line: &str) -> String {
         let (verb, arg) = line.split_once(' ').unwrap_or((line, ""));
         let r = match verb {
-            "apps" => self.android_cmd(&["package", "query-activities", "--brief", "-a", "android.intent.action.MAIN", "-c", "android.intent.category.LAUNCHER"])
-                .map(|out| launcher_components(&out).join(" ")),
+            "apps" => {
+                let r = self.android_cmd(&["package", "query-activities", "--brief", "-a", "android.intent.action.MAIN", "-c", "android.intent.category.LAUNCHER"])
+                    .map(|out| launcher_components(&out).join(" "));
+                if r.is_ok() && !self.android_setup_done { self.android_setup(); }
+                r
+            }
             "notifs" => self.android_run("/system/bin/dumpsys", &["notification", "--noredact"]).map(|d| encode_notifs(&parse_notifs(&d))),
             "launch" if valid_component(arg) => self.android_cmd(&["activity", "start-activity", "-n", arg]).map(|_| String::new()),
             "key" => match arg {
@@ -546,7 +561,7 @@ fn daemon(args: &[String]) {
     // nasce 0600 (sem janela entre bind e chmod). Shell (compositor) tem socket próprio e restrito.
     let l = bind_private(SOCK, 0);
     let shell = bind_private(SHELL_SOCK, SHELL_UID);
-    let mut c = Container { payload, rootfs, wayland_dir, abi64, debug_logcat, props, child: None, fifos: Vec::new(), state: State::Stopped, idle_freeze: Duration::from_secs(idle), close_at: None };
+    let mut c = Container { payload, rootfs, wayland_dir, abi64, debug_logcat, props, child: None, fifos: Vec::new(), android_setup_done: false, state: State::Stopped, idle_freeze: Duration::from_secs(idle), close_at: None };
     eprintln!("[langedroid] pronto em {SOCK} (cold start sob demanda, freeze após {idle}s ocioso)");
     loop {
         // defesa em profundidade além do 0600: confere o uid do peer

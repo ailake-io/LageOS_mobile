@@ -30,6 +30,10 @@ Tela de bloqueio e painel rápido (prévia do shell, `cargo test -- --ignored pr
 ![Tela de bloqueio](docs/img/tela-bloqueio.png)
 ![Painel rápido](docs/img/painel-rapido.png)
 
+Teclado virtual ao tocar num campo de texto (Navegador; o container ainda não tem rede):
+
+![Teclado](docs/img/teclado-navegador.png)
+
 Toque funcionando (tap via virtio-tablet abre o menu do ícone da Galeria; barra de status nativa do LangeOS no topo):
 
 ![Toque no Android](docs/img/android-toque-qemu.png)

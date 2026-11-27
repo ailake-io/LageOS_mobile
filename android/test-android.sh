@@ -65,6 +65,7 @@ a=open('build/touch-pre.ppm','rb').read(); b=open('build/touch-post.ppm','rb').r
 assert a[:2]==b[:2]==b'P6' and len(a)==len(b)
 n=min(len(a),len(b))//3; print(sum(1 for i in range(0,n*3,3) if a[i:i+3]!=b[i:i+3])*100//max(n,1))" 2>/dev/null || echo 0)
   python3 ppm2png.py build/touch-post.ppm build/touch-post.png 2>/dev/null
+  grep -aq 'teclado virtual sempre visível' build/boot.log && echo "OK    teclado virtual do Android habilitado" || { echo "FALTA teclado virtual habilitado"; fail=1; }
   grep -aq 'langedroid\] notifs -> ok' build/boot.log && echo "OK    painel rápido leu as notificações do Android" || { echo "FALTA painel rápido ler notificações"; fail=1; }
   grep -aq 'key back -> ok home' build/boot.log && echo "OK    voltar no app volta à tela inicial nativa" || { echo "FALTA voltar no app voltar à tela inicial nativa"; fail=1; }
   grep -aq 'launch com.android.gallery3d/[^ ]* -> ok' build/boot.log && echo "OK    launcher nativa abriu a Galeria (langedroid launch)" || { echo "FALTA launcher nativa abrir a Galeria"; fail=1; }
