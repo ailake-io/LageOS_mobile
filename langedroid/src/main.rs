@@ -623,7 +623,11 @@ fn serve_one(l: &UnixListener, allowed: u32, f: &mut dyn FnMut(&str) -> String) 
     let mut line = String::new();
     if BufReader::new(&s).read_line(&mut line).is_ok() && !line.trim().is_empty() {
         let reply = f(line.trim());
-        eprintln!("[langedroid] {} -> {}", line.trim(), reply.chars().take(200).collect::<String>());
+        // conteúdo de notificação é privado: no log (persistente em /data/log) só a contagem
+        let shown = if line.trim() == "notifs" && reply.starts_with("ok") {
+            format!("ok ({})", reply.split('\x1e').filter(|e| !e.trim_start_matches("ok").trim().is_empty()).count())
+        } else { reply.chars().take(200).collect() };
+        eprintln!("[langedroid] {} -> {shown}", line.trim());
         let _ = writeln!(&s, "{reply}");
     }
     true

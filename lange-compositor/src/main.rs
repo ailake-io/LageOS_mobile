@@ -249,8 +249,10 @@ impl Tablet {
         while let Ok(n) = self.file.read(&mut buf) && n > 0 {
             for ev in buf[..n].chunks_exact(24) { self.feed(ev, sw, sh, &mut out); }
         }
-        // Down/Up sempre; movimento só nos primeiros (diagnóstico sem inundar o console)
-        if out.iter().any(|e| !matches!(e, TouchEv::Motion(..))) || (!out.is_empty() && INPUT_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5) {
+        // Coordenadas de toque revelam o que se digita (PIN, teclado): só as primeiras (diagnóstico do
+        // boot), ou todas com LANGE_DEBUG_INPUT=1.
+        let all = std::env::var_os("LANGE_DEBUG_INPUT").is_some();
+        if !out.is_empty() && (all || INPUT_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5) {
             eprintln!("[compositor] toque {out:?}");
         }
         out
@@ -813,7 +815,7 @@ fn main() {
                     None => eprintln!("[compositor] apps: {}", reply.chars().take(120).collect::<String>()),
                 }
             } else if req == "notifs" {
-                eprintln!("[compositor] notifs: {}", reply.chars().take(120).collect::<String>());
+                if !reply.starts_with("ok") { eprintln!("[compositor] notifs: {reply}"); }
                 if let Some(n) = shell::parse_notifs(&reply) { app.shell.notifs = n; app.dirty = true; }
             } else if req == "key back" && reply == "ok home" {
                 app.shell.mode = Mode::Home; // saiu do app: tela inicial nativa, não a launcher do Android
