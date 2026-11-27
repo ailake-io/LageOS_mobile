@@ -21,8 +21,10 @@ def btn(down): return [{"type": "btn", "data": {"down": down, "button": "left"}}
 op, a = sys.argv[2], [float(v) for v in sys.argv[3:]] if sys.argv[2] != "screendump" else sys.argv[3:]
 if op == "screendump": cmd("screendump", filename=a[0])
 elif op == "quit": cmd("quit")
+elif op == "tap":  # sem passos intermediários: no QEMU 0.5 s já vira toque longo
+    cmd("input-send-event", events=abs_ev(*a) + btn(True)); cmd("input-send-event", events=btn(False))
 else:
-    x0, y0, x1, y1 = a if op == "swipe" else a * 2
+    x0, y0, x1, y1 = a
     cmd("input-send-event", events=abs_ev(x0, y0)); cmd("input-send-event", events=btn(True))
     for i in range(1, 11):  # 10 passos em ~0.5 s
         time.sleep(0.05); cmd("input-send-event", events=abs_ev(x0 + (x1 - x0) * i / 10, y0 + (y1 - y0) * i / 10))

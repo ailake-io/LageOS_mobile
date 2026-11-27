@@ -14,9 +14,9 @@ qpid=$!
 touched=
 while kill -0 $qpid 2>/dev/null; do
   if grep -aqE 'processing action \(sys.boot_completed=1\)' build/boot.log; then
-    sleep 60  # Launcher só aparece ~30-40 s após boot_completed no QEMU
-    python3 qmp.py "$Q" swipe 0.5 0.05 0.5 0.8 && touched=1
-    sleep 15  # compositor grava screen-post-touch.ppm 4 s após soltar (com fsync) + commit do ext4
+    sleep 150  # QEMU: Launcher sobe ~100 s após boot_completed e é relançada (config: touchscreen novo)
+    python3 qmp.py "$Q" tap 0.457 0.906 && touched=1  # centro do ícone da Galeria na Launcher
+    sleep 30  # compositor grava screen-post-touch.ppm 20 s após soltar (com fsync) + commit do ext4
     python3 qmp.py "$Q" quit 2>/dev/null; break
   fi
   sleep 5
@@ -53,8 +53,8 @@ a=open('build/touch-pre.ppm','rb').read(); b=open('build/touch-post.ppm','rb').r
 assert a[:2]==b[:2]==b'P6' and len(a)==len(b)
 n=min(len(a),len(b))//3; print(sum(1 for i in range(0,n*3,3) if a[i:i+3]!=b[i:i+3])*100//max(n,1))" 2>/dev/null || echo 0)
   python3 ppm2png.py build/touch-post.ppm build/touch-post.png 2>/dev/null
-  [ "$touch_diff" -ge 10 ] && echo "OK    toque muda a tela (${touch_diff}% mudou; android/build/touch-post.png)" || echo "AVISO toque muda a tela (${touch_diff}% mudou): toque chega ao compositor, Android ainda não reage (etapa 7, em aberto)"
-else echo "AVISO teste de toque não rodou (boot não completou)"; fi
+  [ "$touch_diff" -ge 2 ] && echo "OK    toque muda a tela (${touch_diff}% mudou; android/build/touch-post.png)" || { echo "FALTA toque muda a tela (${touch_diff}% mudou)"; fail=1; }
+else echo "FALTA teste de toque (boot não completou)"; fail=1; fi
 # progresso (informativo)
 echo "surfaceflinger iniciado: $(grep -ac "starting service 'surfaceflinger'" build/boot.log)x" \
      "| system_server: $(grep -aqE 'Entered the Android system server|SystemServer: Entered' build/boot.log && echo sim || echo não)" \

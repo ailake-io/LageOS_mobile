@@ -104,7 +104,7 @@ fn zygote64_only(rc: &str) -> String {
 /// seclabel su: build userdebug; sem domínio o init recusa o serviço.
 /// Sem o buffer `kernel`: logd lê o kmsg, então logcat -> kmsg -> logd -> logcat realimentava.
 fn add_debug_logcat(rc: &str) -> String {
-    format!("{rc}\n# langedroid --debug-logcat\nservice lange_logcat /system/bin/logcat -b main -b system -b crash -v brief\n    user root\n    seclabel u:r:su:s0\n    stdio_to_kmsg\n\non early-init\n    start lange_logcat\n")
+    format!("{rc}\n# langedroid --debug-logcat\nservice lange_logcat /system/bin/logcat -b main -b system -b crash -v brief\n    user root\n    seclabel u:r:su:s0\n    stdio_to_kmsg\n\non early-init\n    start lange_logcat\n\n# diagnóstico: /data/lange-diag.sh (posto no data.img pelo host) roda após o boot\nservice lange_diag /system/bin/sh /data/lange-diag.sh\n    user root\n    seclabel u:r:su:s0\n    stdio_to_kmsg\n    oneshot\n    disabled\n\non property:sys.boot_completed=1\n    start lange_diag\n")
 }
 
 /// Arquivos do rootfs a sobrepor (bind) com a política 64-bit. Escreve cópias em /run/langedroid.
@@ -200,7 +200,11 @@ fn enter_rootfs(root: &str, binds: &[(String, String)], wayland_dir: Option<&str
     }
     // Input estilo Waydroid: hwcomposer escreve wl_*_events nestes FIFOs; InputFlinger (patch Waydroid)
     // lê. Quem segura as pontas abertas é o daemon no host (hold_input_fifos), ver lá.
+    // tmpfs próprio, remontado read-only no fim: o ueventd do Android cria /dev/input/event* a partir
+    // do /sys do host e o Android lia o touchscreen direto, sem o compositor (toque duplicado: o
+    // tablet do host aparecia como mouse no centro da tela). FIFO em fs read-only continua lê/escreve.
     fs::create_dir(format!("{dev}/input"))?;
+    mnt("tmpfs", &format!("{dev}/input"), "tmpfs", MS_NOSUID | MS_NOEXEC, "mode=0755")?;
     for f in INPUT_FIFOS {
         let path = format!("{dev}/input/{f}");
         // só system (1000: hwcomposer e system_server); app qualquer não injeta toque
@@ -208,6 +212,7 @@ fn enter_rootfs(root: &str, binds: &[(String, String)], wayland_dir: Option<&str
         std::os::unix::fs::chown(&path, Some(1000), Some(1000))?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o660))?; // umask
     }
+    mnt("", &format!("{dev}/input"), "", MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID | MS_NOEXEC, "")?;
     // O que o 1º estágio do init Android faria (pulamos: é trabalho do host)
     fs::create_dir(format!("{dev}/socket"))?;
     mnt("tmpfs", &format!("{root}/mnt"), "tmpfs", MS_NOSUID, "mode=0755")?;

@@ -30,7 +30,8 @@ use smithay::wayland::compositor::{
 };
 use smithay::wayland::dmabuf::{get_dmabuf, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 use smithay::wayland::output::OutputHandler;
-use smithay::wayland::presentation::PresentationState;
+use smithay::wayland::presentation::{PresentationFeedbackCachedState, PresentationState, Refresh};
+use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use smithay::wayland::shell::xdg::{PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState};
 use smithay::wayland::shm::{with_buffer_contents, ShmHandler, ShmState};
 use smithay::wayland::viewporter::{ViewportCachedState, ViewporterState};
@@ -72,15 +73,21 @@ fn draw(fb: &mut [u32], fw: usize, fh: usize, img: &Image, x: i32, y: i32, dw: u
     };
     let (y0, y1) = span(y, dh, fh);
     let (x0, x1) = span(x, dw, fw);
+    if x0 >= x1 { return; }
+    let tx0 = (x as i64 + x0 as i64) as usize;
+    // coluna de origem p/ cada coluna visível: calculada uma vez, não por pixel (CPU emulada é lenta)
+    let cols: Vec<usize> = (x0..x1).map(|dx| (dx as u128 * img.w as u128 / dw as u128) as usize).collect();
+    let same_w = dw == img.w;
     for dy in y0..y1 {
         let ty = (y as i64 + dy as i64) as usize;
         let sy = (dy as u128 * img.h as u128 / dh as u128) as usize;
         let row = &img.px[sy * img.w..(sy + 1) * img.w];
-        let out = &mut fb[ty * fw..(ty + 1) * fw];
-        for dx in x0..x1 {
-            let s = row[(dx as u128 * img.w as u128 / dw as u128) as usize];
-            let d = &mut out[(x as i64 + dx as i64) as usize];
-            *d = if img.alpha { blend(s, *d) } else { s };
+        let out = &mut fb[ty * fw + tx0..ty * fw + tx0 + cols.len()];
+        match (img.alpha, same_w) {
+            (false, true) => out.copy_from_slice(&row[x0..x1]), // caso comum: 1:1 opaco
+            (false, false) => for (d, &c) in out.iter_mut().zip(&cols) { *d = row[c]; },
+            (true, true) => for (d, &s) in out.iter_mut().zip(&row[x0..x1]) { *d = blend(s, *d); },
+            (true, false) => for (d, &c) in out.iter_mut().zip(&cols) { *d = blend(row[c], *d); },
         }
     }
 }
@@ -88,12 +95,11 @@ fn draw(fb: &mut [u32], fw: usize, fh: usize, img: &Image, x: i32, y: i32, dw: u
 /// Lê pixels de memória do cliente (stride em bytes) p/ Image.
 fn read_pixels(ptr: *const u8, len: usize, off: usize, w: usize, h: usize, stride: usize, swap_rb: bool, alpha: bool) -> Option<Image> {
     if w == 0 || h == 0 || stride < w * 4 || off + stride * (h - 1) + w * 4 > len { return None; }
-    let mut px = Vec::with_capacity(w * h);
-    for row in 0..h {
-        for col in 0..w {
-            let p = unsafe { (ptr.add(off + row * stride + col * 4) as *const u32).read_unaligned() };
-            px.push(to_argb(p, swap_rb, alpha));
-        }
+    let mut px = vec![0u32; w * h];
+    for (row, out) in px.chunks_exact_mut(w).enumerate() {
+        // cópia da linha inteira (memcpy) e conversão no lugar: bem mais rápido que ler pixel a pixel
+        unsafe { std::ptr::copy_nonoverlapping(ptr.add(off + row * stride), out.as_mut_ptr() as *mut u8, w * 4) };
+        if swap_rb || !alpha { for p in out.iter_mut() { *p = to_argb(u32::from_le(*p), swap_rb, alpha); } }
     }
     Some(Image { w, h, px, alpha })
 }
@@ -134,6 +140,14 @@ const POLLIN: i16 = 1;
 unsafe extern "C" {
     fn poll(fds: *mut PollFd, n: std::ffi::c_ulong, timeout_ms: i32) -> i32;
     fn ioctl(fd: i32, request: std::ffi::c_ulong, ...) -> i32;
+    fn clock_gettime(clk: i32, ts: *mut [i64; 2]) -> i32;
+}
+
+/// CLOCK_MONOTONIC (o clock anunciado no wp_presentation).
+fn monotonic() -> Duration {
+    let mut ts = [0i64; 2];
+    unsafe { clock_gettime(1, &mut ts) };
+    Duration::new(ts[0] as u64, ts[1] as u32)
 }
 
 /// _IOWR('d', DRM_COMMAND_BASE + nr, size) — codificação genérica do Linux (arm64/x86).
@@ -365,10 +379,10 @@ impl Screen {
         let pitch = db.pitch() as usize;
         let Ok(mut m) = card.map_dumb_buffer(db) else { return };
         let out = m.as_mut();
+        // fb é u32 nativo = XRGB8888 little-endian (arm64/x86): copia bytes direto
+        let src = unsafe { std::slice::from_raw_parts(self.fb.as_ptr() as *const u8, self.fb.len() * 4) };
         for y in 0..self.h {
-            let row = &self.fb[y * self.w..(y + 1) * self.w];
-            let dst = &mut out[y * pitch..y * pitch + self.w * 4];
-            for (d, s) in dst.chunks_exact_mut(4).zip(row) { d.copy_from_slice(&s.to_le_bytes()); }
+            out[y * pitch..y * pitch + self.w * 4].copy_from_slice(&src[y * self.w * 4..(y + 1) * self.w * 4]);
         }
     }
 
@@ -406,6 +420,8 @@ struct App {
     seat: Seat<App>,
     touch_focus: Option<(WlSurface, smithay::utils::Point<f64, smithay::utils::Logical>)>,
     start: Instant,
+    frame_seq: u64,
+    import_time: Duration,
 }
 
 impl BufferHandler for App { fn buffer_destroyed(&mut self, _b: &wl_buffer::WlBuffer) {} }
@@ -542,16 +558,23 @@ impl App {
         out
     }
 
-    /// Superfície mais à frente sob (px,py) e a origem dela na tela (foco do toque).
+    /// Janela (toplevel) sob (px,py) e a origem dela na tela (foco do toque). O foco é sempre a
+    /// superfície raiz: o hwcomposer do Waydroid repassa as coordenadas locais do wl_touch direto ao
+    /// Android, como coordenadas da janela; com foco numa subsurface (ex.: barra de navegação) o
+    /// toque caía no lugar errado.
     fn surface_at(&self, px: f64, py: f64) -> Option<(WlSurface, smithay::utils::Point<f64, smithay::utils::Logical>)> {
-        self.layers().into_iter().rev()
-            .find(|&(_, x, y, w, h)| px >= x as f64 && py >= y as f64 && px < x as f64 + w as f64 && py < y as f64 + h as f64)
-            .map(|(s, x, y, _, _)| (s, (x as f64, y as f64).into()))
+        let (w, h) = (self.size.0 as f64, (self.size.1 - BAR as i32) as f64);
+        let (x, y) = (px, py - BAR as f64);
+        if x < 0.0 || y < 0.0 || x >= w || y >= h { return None; }
+        // ponytail: janelas em tela cheia empilhadas; a última criada fica na frente
+        self.xdg.toplevel_surfaces().last().map(|t| (t.wl_surface().clone(), (0.0, BAR as f64).into()))
     }
 
     /// Compõe barra de status (nativa) + todas as janelas no framebuffer.
     fn render(&mut self, screen: &mut Screen) {
+        let t = Instant::now();
         self.import_pending();
+        self.import_time += t.elapsed();
         screen.fb.fill(0xff10_1418); // fundo LangeOS
         let (fw, fh) = (screen.w, screen.h);
         for (surf, x, y, dw, dh) in self.layers() {
@@ -584,13 +607,20 @@ impl App {
         t.frame(self);
     }
 
+    /// frame callbacks + wp_presentation "presented". Sem o presented o hwcomposer do Waydroid não
+    /// libera o present fence e o SurfaceFlinger para de mandar quadros (Android congelava na tela).
     fn send_frames(&mut self, time_ms: u32) {
+        let now = monotonic();
+        self.frame_seq += 1;
+        let (output, seq) = (&self.output, self.frame_seq);
         for top in self.xdg.toplevel_surfaces() {
             with_surface_tree_downward(
                 top.wl_surface(), (),
                 |_, _, _| TraversalAction::DoChildren(()),
                 |_, states, _| {
                     for cb in states.cached_state.get::<SurfaceAttributes>().current().frame_callbacks.drain(..) { cb.done(time_ms); }
+                    let fbs = std::mem::take(&mut states.cached_state.get::<PresentationFeedbackCachedState>().current().callbacks);
+                    for fb in fbs { fb.presented(output, now, Refresh::Fixed(FRAME), seq, wp_presentation_feedback::Kind::empty()); }
                 },
                 |_, _, _| true,
             );
@@ -655,9 +685,10 @@ fn main() {
         seat,
         touch_focus: None,
         start: Instant::now(),
+        frame_seq: 0,
+        import_time: Duration::ZERO,
     };
-    let _ = &app.output;
-
+    
     if let Some(dir) = std::path::Path::new(&socket).parent() { let _ = fs::create_dir_all(dir); }
     let _ = fs::remove_file(&socket);
     let listener = ListeningSocket::bind_absolute(socket.clone().into()).expect("bind socket wayland");
@@ -681,6 +712,8 @@ fn main() {
     let mut minute = clock_now();
     // diagnóstico do toque (android/test-android.sh): quadro antes do 1º toque e ~4 s após soltar
     let (mut pre_touch_saved, mut post_touch_at) = (false, None::<Instant>);
+    // estatística a cada 10 s: commits recebidos, quadros desenhados, tempo médio de render
+    let (mut stat_at, mut renders, mut render_time, mut last_commits) = (Instant::now(), 0u32, Duration::ZERO, 0u32);
     let mut last_shot = Instant::now() - Duration::from_secs(10);
     let mut last_frame = Instant::now() - FRAME;
     let mut best_lit = 0usize; // quadro mais "aceso" já visto -> <screenshot>-max.ppm (diagnóstico)
@@ -706,7 +739,8 @@ fn main() {
                         pre_touch_saved = true;
                         let _ = screen.screenshot(&p.replace(".ppm", "-pre-touch.ppm"));
                     }
-                    if ev == TouchEv::Up { post_touch_at = Some(Instant::now() + Duration::from_secs(4)); }
+                    // QEMU: Android reage devagar
+                    if ev == TouchEv::Up { post_touch_at = Some(Instant::now() + Duration::from_secs(20)); }
                 }
                 app.touch(ev);
             }
@@ -716,11 +750,20 @@ fn main() {
         if app.dirty && last_frame.elapsed() >= FRAME {
             app.dirty = false;
             last_frame = Instant::now();
+            let t = Instant::now();
             app.render(&mut screen);
             screen.present();
+            renders += 1;
+            render_time += t.elapsed();
             app.send_frames(app.start.elapsed().as_millis() as u32);
         }
         let _ = display.flush_clients();
+        if stat_at.elapsed() >= Duration::from_secs(10) {
+            eprintln!("[compositor] 10s: commits={} quadros={} render_médio={:?} (import {:?})", app.commits - last_commits, renders,
+                render_time.checked_div(renders.max(1)).unwrap_or_default(), app.import_time.checked_div(renders.max(1)).unwrap_or_default());
+            app.import_time = Duration::ZERO;
+            (stat_at, renders, render_time, last_commits) = (Instant::now(), 0, Duration::ZERO, app.commits);
+        }
         if let (Some(p), Some(at)) = (&shot, post_touch_at) && Instant::now() >= at {
             post_touch_at = None;
             let _ = screen.screenshot(&p.replace(".ppm", "-post-touch.ppm"));
