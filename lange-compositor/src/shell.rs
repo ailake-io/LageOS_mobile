@@ -25,7 +25,7 @@ impl AppEntry {
 
 /// O que o compositor deve fazer depois de um toque no shell.
 #[derive(Debug, PartialEq)]
-pub enum Action { None, Redraw, Launch(String), Key(&'static str), Notifs }
+pub enum Action { None, Redraw, Launch(String), Key(&'static str), Notifs, Volume(u8) }
 
 /// Nome curto a partir do pacote: com.android.gallery3d -> "Gallery". ponytail: sem o rótulo real do
 /// APK (precisaria ler resources.arsc); trocar quando o langedroid devolver o label.
@@ -141,6 +141,9 @@ impl Canvas<'_> {
 
 // ---------- shell ----------
 
+/// Início (x) dos controles deslizantes do painel (texto à esquerda).
+const SLIDER_X: i32 = 110;
+
 /// Célula da grade da tela inicial.
 const CELL_W: i32 = 128;
 const CELL_H: i32 = 124;
@@ -154,11 +157,19 @@ pub struct Shell {
     pub panel: bool,
     /// notificações do Android: (título, texto)
     pub notifs: Vec<(String, String)>,
+    /// brilho da tela em % (10..=100); aplicado pelo compositor
+    pub brightness: u8,
+    /// volume de mídia do Android (0..=VOL_MAX)
+    pub volume: u8,
+    /// rede do Android: None = desconhecido, Some(iface vazio) = sem rede
+    pub net: Option<String>,
 }
+
+pub const VOL_MAX: u8 = 15;
 
 impl Shell {
     pub fn new() -> Shell {
-        Shell { mode: Mode::Locked, apps: vec![], recents: vec![], font: Font::new(), down: None, page: 0, panel: false, notifs: vec![] }
+        Shell { mode: Mode::Locked, apps: vec![], recents: vec![], font: Font::new(), down: None, page: 0, panel: false, notifs: vec![], brightness: 100, volume: 8, net: None }
     }
 
     /// Shell recebe o toque (e não a janela Android)?
@@ -215,6 +226,12 @@ impl Shell {
         if self.panel {
             // painel: arrastar p/ cima ou tocar fora fecha
             if (swipe && dy < 0.0) || (!swipe && y as i32 > Self::panel_bottom(h)) { self.panel = false; return Action::Redraw; }
+            // controles deslizantes: toque ou arrasto na linha (vale o x final)
+            if dy.abs() < 40.0 {
+                let f = ((x as i32 - SLIDER_X) as f64 / (w as i32 - 2 * SLIDER_X) as f64).clamp(0.0, 1.0);
+                if Self::slider_row(sy as i32) == Some(0) { self.brightness = (10.0 + f * 90.0).round() as u8; return Action::Redraw; }
+                if Self::slider_row(sy as i32) == Some(1) { self.volume = (f * VOL_MAX as f64).round() as u8; return Action::Volume(self.volume); }
+            }
             return Action::None;
         }
         if sy < BAR as f64 && dy > 60.0 && self.mode != Mode::Locked { self.panel = true; return Action::Notifs; }
@@ -233,7 +250,11 @@ impl Shell {
         self.tap(x as i32, y as i32, w, h)
     }
 
-    fn panel_bottom(h: usize) -> i32 { (h as i32 * 3 / 5).max(BAR as i32 + 200) }
+    fn panel_bottom(h: usize) -> i32 { (h as i32 * 3 / 5).max(BAR as i32 + 300) }
+
+    /// Linhas dos controles no painel: 0 = brilho, 1 = volume (y do centro).
+    fn slider_y(i: i32) -> i32 { BAR as i32 + 120 + i * 48 }
+    fn slider_row(y: i32) -> Option<i32> { (0..2).find(|&i| (y - Self::slider_y(i)).abs() < 22) }
 
     pub fn tap(&mut self, x: i32, y: i32, w: usize, h: usize) -> Action {
         let inside = |(rx, ry, rw, rh): (i32, i32, i32, i32)| x >= rx && y >= ry && x < rx + rw && y < ry + rh;
@@ -344,7 +365,8 @@ impl Shell {
         // barra de status: nome à esquerda, bateria + relógio à direita
         c.rect(0, 0, w as i32, BAR as i32, BG_BAR);
         self.font.draw(c, 12, 22, 15, FG_DIM, "LangeOS");
-        let right = match battery { Some(b) => format!("{b}%  {clock}"), None => clock.to_string() };
+        let net = match self.net.as_deref() { Some("") => "Sem rede  ", Some(_) => "Rede  ", None => "" };
+        let right = match battery { Some(b) => format!("{net}{b}%  {clock}"), None => format!("{net}{clock}") };
         let rw = self.font.width(&right, 16);
         self.font.draw(c, w as i32 - rw - 12, 22, 16, FG, &right);
         // barra de navegação: ◁ ○ □
@@ -376,7 +398,16 @@ impl Shell {
             let tw = self.font.width(&t, 18);
             self.font.draw(c, w - tw - 24, y, 18, FG_DIM, &t);
         }
-        y += 28;
+        for (i, (name, f)) in [("Brilho", (self.brightness - 10) as f64 / 90.0), ("Volume", self.volume as f64 / VOL_MAX as f64)].into_iter().enumerate() {
+            let cy = Self::slider_y(i as i32);
+            self.font.draw(c, 24, cy + 6, 15, FG_DIM, name);
+            let (x0, tw) = (SLIDER_X, w - 2 * SLIDER_X);
+            c.rounded(x0, cy - 4, tw, 8, 4, 0xff2f_3a48);
+            let fx = (tw as f64 * f) as i32;
+            c.rounded(x0, cy - 4, fx.max(8), 8, 4, 0xff4f_9dde);
+            c.rounded(x0 + fx - 10, cy - 10, 20, 20, 10, FG);
+        }
+        y = Self::slider_y(1) + 36;
         if self.notifs.is_empty() {
             self.font.draw(c, 24, y + 24, 17, FG_DIM, "Sem notificações");
         }
@@ -488,6 +519,14 @@ mod tests {
         s.touch_down(600.0, 10.0);
         assert_eq!(s.touch_up(600.0, 300.0, w, h), Action::Notifs);
         assert!(s.panel && s.wants_touch());
+        // controles: volume no fim da linha = máximo; brilho no começo = mínimo
+        let (vy, by) = (Shell::slider_y(1) as f64, Shell::slider_y(0) as f64);
+        s.touch_down(640.0, vy);
+        assert_eq!(s.touch_up(1279.0, vy, w, h), Action::Volume(VOL_MAX));
+        s.touch_down(0.0, by);
+        assert_eq!(s.touch_up(0.0, by, w, h), Action::Redraw);
+        assert_eq!(s.brightness, 10);
+        assert!(s.panel);
         s.touch_down(600.0, 300.0);
         assert_eq!(s.touch_up(600.0, 100.0, w, h), Action::Redraw);
         assert!(!s.panel);

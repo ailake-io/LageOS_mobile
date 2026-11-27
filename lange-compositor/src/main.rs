@@ -569,6 +569,14 @@ impl App {
             }
         }
         self.shell.draw(&mut Canvas { px: &mut screen.fb, w: fw, h: fh }, &clock_now(), shell::battery());
+        // ponytail: brilho por software (escurece o quadro); /sys/class/backlight no aparelho real
+        let b = self.shell.brightness as u32;
+        if b < 100 {
+            for p in screen.fb.iter_mut() {
+                let ch = |s: u32| ((*p >> s & 0xff) * b / 100) << s;
+                *p = 0xff00_0000 | ch(16) | ch(8) | ch(0);
+            }
+        }
     }
 
     /// Toque: barras e tela inicial/recentes são do shell; o resto vai p/ a janela Android.
@@ -592,6 +600,7 @@ impl App {
                 Action::Launch(c) => { self.requests.push(format!("launch {c}")); self.dirty = true; }
                 Action::Key(k) => { self.requests.push(format!("key {k}")); self.dirty = true; }
                 Action::Notifs => { self.requests.push("notifs".into()); self.dirty = true; }
+                Action::Volume(v) => { self.requests.push(format!("volume {v}")); self.dirty = true; }
             }
         }
     }
@@ -796,6 +805,7 @@ fn main() {
         if !apps_pending && apps_asked.elapsed() >= Duration::from_secs(every) {
             apps_asked = Instant::now();
             apps_pending = req_tx.send("apps".into()).is_ok();
+            let _ = req_tx.send("net".into());
         }
         for r in app.requests.drain(..) { let _ = req_tx.send(r); }
         while let Ok((req, reply)) = resp_rx.try_recv() {
@@ -814,6 +824,9 @@ fn main() {
                     Some(_) => {}
                     None => eprintln!("[compositor] apps: {}", reply.chars().take(120).collect::<String>()),
                 }
+            } else if req == "net" {
+                let net = reply.strip_prefix("ok").map(|i| i.trim().to_string());
+                if net.is_some() && net != app.shell.net { app.shell.net = net; app.dirty = true; }
             } else if req == "notifs" {
                 if !reply.starts_with("ok") { eprintln!("[compositor] notifs: {reply}"); }
                 if let Some(n) = shell::parse_notifs(&reply) { app.shell.notifs = n; app.dirty = true; }

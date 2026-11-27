@@ -283,6 +283,16 @@ fn hold_input_fifos(pid: u32) -> Vec<fs::File> {
     held
 }
 
+/// /proc/net/fib_trie tem endereço local fora de 127.0.0.0/8?
+fn has_ipv4(trie: &str) -> bool {
+    let mut last = "";
+    trie.lines().any(|l| {
+        let l = l.trim();
+        if let Some(ip) = l.strip_prefix("|-- ") { last = ip; }
+        l == "/32 host LOCAL" && !last.starts_with("127.")
+    })
+}
+
 /// Mensagem netlink RTM_NEWLINK: move a interface `ifindex` p/ o net ns do processo `pid`.
 fn netns_move_msg(ifindex: i32, pid: u32) -> Vec<u8> {
     let mut m = Vec::with_capacity(40);
@@ -539,6 +549,12 @@ impl Container {
                 r
             }
             "notifs" => self.android_run("/system/bin/dumpsys", &["notification", "--noredact"]).map(|d| encode_notifs(&parse_notifs(&d))),
+            // ponytail: endereço IPv4 no container = "rede"; validação (internet de fato) via dumpsys se precisar
+            "net" => self.android_init().ok_or("sem init do container".to_string())
+                .and_then(|p| fs::read_to_string(format!("/proc/{p}/net/fib_trie")).map_err(|e| e.to_string()))
+                .map(|t| if has_ipv4(&t) { "on".into() } else { String::new() }),
+            "volume" if arg.parse::<u8>().is_ok_and(|v| v <= 15) =>
+                self.android_cmd(&["media_session", "volume", "--stream", "3", "--set", arg]).map(|_| String::new()),
             "launch" if valid_component(arg) => self.android_cmd(&["activity", "start-activity", "-n", arg]).map(|_| String::new()),
             "key" => match arg {
                 // Voltar na 1ª tela do app leva p/ a launcher do Android: avisa o shell ("home") p/ ele
@@ -754,6 +770,13 @@ fn selftest() -> bool {
 
 #[cfg(test)]
 mod shell_tests {
+    #[test]
+    fn has_ipv4() {
+        let lo = "Main:\n  +-- 127.0.0.0/8 2 0 2\n     |-- 127.0.0.1\n        /32 host LOCAL\n";
+        assert!(!super::has_ipv4(lo));
+        assert!(super::has_ipv4(&format!("{lo}  |-- 10.0.2.15\n     /32 host LOCAL\n")));
+    }
+
     #[test]
     fn netns_msg() {
         let m = super::netns_move_msg(2, 77);
