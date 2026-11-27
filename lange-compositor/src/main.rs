@@ -145,27 +145,36 @@ const VIRTGPU_WAIT: std::ffi::c_ulong = drm_iowr(0x08, 8);
 /// Com virgl o Android renderiza na GPU do host; a memória da guest só reflete o resultado após
 /// TRANSFER_FROM_HOST (o que o driver virgl da Mesa faz ao mapear). Em GPU real o ioctl falha
 /// (não é virtio) e nada muda. ponytail: transfere o quadro inteiro a cada commit.
-fn virtio_readback(card: &Card, dmabuf: &Dmabuf, w: u32, h: u32, stride: u32) {
+/// Resultado p/ diagnóstico: Ok, ou o passo + erro que falhou.
+fn virtio_readback(card: &Card, dmabuf: &Dmabuf, w: u32, h: u32, stride: u32) -> Result<(), String> {
     use drm::control::Device as _;
-    let Some(fd) = dmabuf.handles().next() else { return };
-    let Ok(handle) = card.prime_fd_to_buffer(fd) else { return };
+    let fd = dmabuf.handles().next().ok_or("sem plano")?;
+    let handle = card.prime_fd_to_buffer(fd).map_err(|e| format!("prime import: {e}"))?;
     let bo: u32 = handle.into();
     let mut xfer = [bo, 0, 0, 0, w, h, 1, 0, 0, stride, 0u32]; // handle, box{x,y,z,w,h,d}, level, offset, stride, layer_stride
     let mut wait = [bo, 0u32];
     let fd = card.0.as_fd().as_raw_fd();
-    unsafe {
-        if ioctl(fd, VIRTGPU_TRANSFER_FROM_HOST, xfer.as_mut_ptr()) == 0 {
-            ioctl(fd, VIRTGPU_WAIT, wait.as_mut_ptr());
-        }
-    }
+    let res = unsafe {
+        if ioctl(fd, VIRTGPU_TRANSFER_FROM_HOST, xfer.as_mut_ptr()) != 0 {
+            Err(format!("transfer: {}", std::io::Error::last_os_error()))
+        } else if ioctl(fd, VIRTGPU_WAIT, wait.as_mut_ptr()) != 0 {
+            Err(format!("wait: {}", std::io::Error::last_os_error()))
+        } else { Ok(()) }
+    };
     let _ = card.close_buffer(handle);
+    res
 }
+
+static READBACK_LOGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 fn import_dmabuf(dmabuf: &Dmabuf, card: Option<&Card>) -> Option<Image> {
     let (swap, alpha) = fourcc_info(dmabuf.format().code)?;
     let stride = dmabuf.strides().next()? as usize;
     let size = dmabuf.size();
-    if let Some(card) = card { virtio_readback(card, dmabuf, size.w as u32, size.h as u32, stride as u32); }
+    if let Some(card) = card {
+        let r = virtio_readback(card, dmabuf, size.w as u32, size.h as u32, stride as u32);
+        if READBACK_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 { eprintln!("[compositor] readback virtio: {r:?}"); }
+    }
     let _ = dmabuf.sync_plane(0, DmabufSyncFlags::START | DmabufSyncFlags::READ);
     let map = dmabuf.map_plane(0, DmabufMappingMode::READ).ok()?;
     let img = read_pixels(map.ptr() as *const u8, map.length(), 0, size.w as usize, size.h as usize, stride, swap, alpha);
@@ -354,8 +363,8 @@ impl App {
             let img = match get_dmabuf(&buf) { Ok(d) => import_dmabuf(d, self.card.as_ref()), Err(_) => import_shm(&buf) };
             buf.release();
             // ponytail: log só das primeiras cópias (diagnóstico da etapa 7), sem inundar o console
-            if self.commits < 20 {
-                self.commits += 1;
+            self.commits += 1;
+            if self.commits <= 20 || self.commits % 100 == 0 {
                 let lit = img.as_ref().map_or(0, |i| i.px.iter().filter(|&&p| p & 0x00ff_ffff != 0).count());
                 eprintln!("[compositor] commit {kind} {:?} pixels_acesos={lit}", img.as_ref().map(|i| (i.w, i.h)));
             }
