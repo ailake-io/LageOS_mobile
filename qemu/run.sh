@@ -41,8 +41,9 @@ if [ -n "${ANDROID:-}" ]; then
   printf '/dev/vdc /android/root ext4 ro\n/dev/vdd /android/root/vendor ext4 ro\n/dev/vde /android/root/data ext4 rw\n' >> "$R/etc/lange/fstab"
   # 1º estágio do init Android (mknod /dev, fstab) é trabalho do host: entra no selinux_setup
   # (carrega a sepolicy do Android, permissiva) que então chama o 2º estágio.
-  # gráficos estilo Waydroid: EGL Mesa + gralloc gbm no render node
-  GFX_PROPS='--prop ro.hardware.egl=mesa --prop ro.hardware.gralloc=gbm --prop gralloc.gbm.device=/dev/dri/renderD128 '
+  # gráficos estilo Waydroid (LineageOS 20): EGL Mesa + gralloc minigbm_gbm_mesa. O hwcomposer
+  # escolhe como ler o handle do buffer pela substring 'minigbm' nessa prop; com 'gbm' caía no caminho shm.
+  GFX_PROPS='--prop ro.hardware.egl=mesa --prop ro.hardware.gralloc=minigbm_gbm_mesa --prop gralloc.gbm.device=/dev/dri/renderD128 '
   # kernel mainline não tem ashmem (removido na 5.18): libcutils usa memfd (HWC/FMQ, zygote)
   GFX_PROPS+='--prop sys.use_memfd=true '
   # sem ponte de sensores ainda (HAL Rust, §4B): HAL do Waydroid registra stubs em vez de sair.
