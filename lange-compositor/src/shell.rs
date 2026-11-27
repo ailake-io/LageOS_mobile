@@ -186,7 +186,7 @@ pub enum PinStep { Unlock, Current, New, Confirm }
 const PIN_MIN: usize = 4;
 const PIN_MAX: usize = 8;
 /// erros seguidos antes da espera
-const PIN_TRIES: u32 = 5;
+pub const PIN_TRIES: u32 = 5;
 const PIN_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// teclado: 3 colunas x 4 linhas (1-9, ⌫ 0 OK)
 const KEY: i32 = 76;

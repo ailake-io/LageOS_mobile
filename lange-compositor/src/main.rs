@@ -664,6 +664,16 @@ const SHELL_SOCK: &str = "/run/langedroid-shell.sock";
 
 /// Thread que fala com o langedroid: comandos podem levar segundos (container lento no QEMU) e o
 /// loop do compositor não pode parar. Uma conexão por pedido; resposta = (pedido, linha).
+/// tmp + fsync + rename: queda de energia não deixa arquivo pela metade.
+fn write_atomic(path: &str, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = format!("{path}.tmp");
+    let mut f = fs::File::create(&tmp)?;
+    f.write_all(text.as_bytes())?;
+    f.sync_all()?;
+    fs::rename(&tmp, path)
+}
+
 fn shell_client() -> (std::sync::mpsc::Sender<String>, std::sync::mpsc::Receiver<(String, String)>) {
     let (req_tx, req_rx) = std::sync::mpsc::channel::<String>();
     let (resp_tx, resp_rx) = std::sync::mpsc::channel();
@@ -770,7 +780,12 @@ fn main() {
     let _ = fs::set_permissions(PIN_DIR, fs::Permissions::from_mode(0o700));
     app.shell.pin = pin::Pin::load(PIN_FILE);
     // erros de PIN sobrevivem a reinício do compositor (senão reiniciar zerava a espera)
-    app.shell.set_pin_fails(fs::read_to_string(PIN_FAILS_FILE).ok().and_then(|t| t.trim().parse().ok()).unwrap_or(0));
+    // sem arquivo = 0; arquivo ilegível = falha fechada (uma leva de erros: espera ativa)
+    app.shell.set_pin_fails(match fs::read_to_string(PIN_FAILS_FILE) {
+        Ok(t) => t.trim().parse().unwrap_or(shell::PIN_TRIES),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(_) => shell::PIN_TRIES,
+    });
     let mut saved_fails = app.shell.pin_fails();
     let mut tablet = Tablet::open();
     if tablet.is_none() { eprintln!("[compositor] sem dispositivo de toque"); }
@@ -817,7 +832,7 @@ fn main() {
                 app.touch(ev);
                 if app.shell.pin_fails() != saved_fails {
                     saved_fails = app.shell.pin_fails();
-                    if let Err(e) = fs::write(PIN_FAILS_FILE, saved_fails.to_string()) { eprintln!("[compositor] erros de PIN: {e}"); }
+                    if let Err(e) = write_atomic(PIN_FAILS_FILE, &saved_fails.to_string()) { eprintln!("[compositor] erros de PIN: {e}"); }
                 }
             }
         }
