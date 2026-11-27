@@ -102,8 +102,9 @@ fn zygote64_only(rc: &str) -> String {
 
 /// Anexa um serviço logcat (stdout -> kmsg via stdio_to_kmsg) a um .rc existente (o init só lê .rc de diretórios read-only).
 /// seclabel su: build userdebug; sem domínio o init recusa o serviço.
+/// Sem o buffer `kernel`: logd lê o kmsg, então logcat -> kmsg -> logd -> logcat realimentava.
 fn add_debug_logcat(rc: &str) -> String {
-    format!("{rc}\n# langedroid --debug-logcat\nservice lange_logcat /system/bin/logcat -b all -v brief\n    user root\n    seclabel u:r:su:s0\n    stdio_to_kmsg\n\non early-init\n    start lange_logcat\n")
+    format!("{rc}\n# langedroid --debug-logcat\nservice lange_logcat /system/bin/logcat -b main -b system -b crash -v brief\n    user root\n    seclabel u:r:su:s0\n    stdio_to_kmsg\n\non early-init\n    start lange_logcat\n")
 }
 
 /// Arquivos do rootfs a sobrepor (bind) com a política 64-bit. Escreve cópias em /run/langedroid.
