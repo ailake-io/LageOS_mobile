@@ -61,6 +61,8 @@ fn mnt(src: &str, tgt: &str, fstype: &str, flags: usize, data: &str) -> std::io:
     let data_ptr = if data.is_empty() { std::ptr::null() } else { data.as_ptr().cast() };
     if unsafe { mount(src.as_ptr().cast(), tgt.as_ptr().cast(), fstype.as_ptr().cast(), flags, data_ptr) } != 0 {
         let e = std::io::Error::last_os_error();
+        // pre_exec só devolve o errno ao spawn(); o contexto vai p/ o stderr (console)
+        eprintln!("[langedroid] mount {src:?} -> {tgt:?} ({fstype:?}): {e}");
         return Err(std::io::Error::new(e.kind(), format!("mount {tgt:?}: {e}")));
     }
     Ok(())
@@ -220,6 +222,7 @@ fn enter_rootfs(root: &str, binds: &[(String, String)], wayland_dir: Option<&str
         if chdir(r.as_ptr().cast()) != 0 || syscall(SYS_PIVOT_ROOT, dot.as_ptr(), dot.as_ptr()) != 0
             || umount2(dot.as_ptr().cast(), MNT_DETACH) != 0 || chdir(c"/".as_ptr().cast()) != 0 {
             let e = std::io::Error::last_os_error();
+            eprintln!("[langedroid] pivot_root {root}: {e}");
             return Err(std::io::Error::new(e.kind(), format!("pivot_root {root}: {e}")));
         }
     }
