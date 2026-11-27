@@ -15,9 +15,11 @@ done
 grep -q "Kernel panic" build/boot.log && { echo "FALHOU: kernel panic"; fail=1; }
 grep -qE 'init: Reboot start|InitFatalReboot' build/boot.log && { echo "FALHOU: Android pediu reboot: $(grep -oE "Reboot start, reason: [^,]*|critical process '[^']+'" build/boot.log | head -1)"; fail=1; }
 # screenshot do lange-compositor (/data do host = qemu/build/data.img)
-rm -f build/screen.ppm build/screen.png
+rm -f build/screen.ppm build/screen.png build/screen-max.ppm build/screen-max.png
 debugfs -R "dump /screen.ppm build/screen.ppm" ../qemu/build/data.img 2>/dev/null
 [ -s build/screen.ppm ] && python3 ppm2png.py build/screen.ppm build/screen.png && echo "screenshot: android/build/screen.png"
+debugfs -R "dump /screen-max.ppm build/screen-max.ppm" ../qemu/build/data.img 2>/dev/null
+[ -s build/screen-max.ppm ] && python3 ppm2png.py build/screen-max.ppm build/screen-max.png && echo "quadro mais aceso: android/build/screen-max.png"
 # progresso (informativo)
 echo "surfaceflinger iniciado: $(grep -ac "starting service 'surfaceflinger'" build/boot.log)x" \
      "| system_server: $(grep -aqE 'Entered the Android system server|SystemServer: Entered' build/boot.log && echo sim || echo não)" \

@@ -487,6 +487,7 @@ fn main() {
     let start = Instant::now();
     let mut last_shot = Instant::now() - Duration::from_secs(10);
     let mut last_frame = Instant::now() - FRAME;
+    let mut best_lit = 0usize; // quadro mais "aceso" já visto -> <screenshot>-max.ppm (diagnóstico)
     let mut clients = Vec::new();
     loop {
         // Acorda quando um cliente fala (o socket dele não enche) ou no próximo quadro.
@@ -513,6 +514,11 @@ fn main() {
         if let Some(p) = &shot && last_shot.elapsed() >= Duration::from_secs(2) {
             last_shot = Instant::now();
             if let Err(e) = screen.screenshot(p) { eprintln!("[compositor] screenshot: {e}"); }
+            let lit = screen.fb.iter().filter(|&&px| px & 0x00ff_ffff != 0 && px != 0xff10_1418).count();
+            if lit > best_lit {
+                best_lit = lit;
+                let _ = screen.screenshot(&p.replace(".ppm", "-max.ppm"));
+            }
         }
     }
 }
