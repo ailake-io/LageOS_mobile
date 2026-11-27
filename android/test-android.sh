@@ -20,6 +20,14 @@ debugfs -R "dump /screen.ppm build/screen.ppm" ../qemu/build/data.img 2>/dev/nul
 [ -s build/screen.ppm ] && python3 ppm2png.py build/screen.ppm build/screen.png && echo "screenshot: android/build/screen.png"
 debugfs -R "dump /screen-max.ppm build/screen-max.ppm" ../qemu/build/data.img 2>/dev/null
 [ -s build/screen-max.ppm ] && python3 ppm2png.py build/screen-max.ppm build/screen-max.png && echo "quadro mais aceso: android/build/screen-max.png"
+# Etapa 6/7: Android visível = >= 30% da tela diferente do fundo do LangeOS (0x101418) e do preto
+if [ -s build/screen.ppm ]; then
+  lit=$(python3 -c "
+d=open('build/screen.ppm','rb').read(); p=d.split(maxsplit=4); w,h,px=int(p[1]),int(p[2]),p[4]
+n=sum(1 for i in range(0,w*h*3,3) if px[i:i+3] not in (b'\\x10\\x14\\x18', b'\\x00\\x00\\x00'))
+print(n*100//(w*h))")
+  [ "$lit" -ge 30 ] && echo "OK    tela Android visível (${lit}% da tela)" || { echo "FALTA tela Android visível (${lit}% da tela)"; fail=1; }
+else echo "FALTA screenshot do compositor"; fail=1; fi
 # progresso (informativo)
 echo "surfaceflinger iniciado: $(grep -ac "starting service 'surfaceflinger'" build/boot.log)x" \
      "| system_server: $(grep -aqE 'Entered the Android system server|SystemServer: Entered' build/boot.log && echo sim || echo não)" \

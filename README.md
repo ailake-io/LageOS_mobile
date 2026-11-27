@@ -16,6 +16,10 @@ SO móvel em Rust, leve (512 MB+) e seguro, com compatibilidade Android via cont
 
 Início rápido: `kernel/build.sh && qemu/test-boot.sh`
 
+Android (LineageOS 20) no container, desenhado pelo `lange-compositor`, no QEMU (`android/fetch.sh && GPU=virgl android/test-android.sh 600`):
+
+![Launcher Android no LangeOS](docs/img/android-launcher-qemu.png)
+
 ## Licença
 
 Dual: [MIT](LICENSE-MIT) ou [Apache-2.0](LICENSE-APACHE), à sua escolha. O kernel Linux baixado/compilado por `kernel/build.sh` segue GPL-2.0.

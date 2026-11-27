@@ -31,8 +31,8 @@ Revisão do Blueprint e plano prático. Data: 2026-11-26.
 | 3 | init: shutdown/reboot por sinal, cgroup v2 por serviço, log | `poweroff` limpo no QEMU (`qemu/test-boot.sh`) | ✅ sinais + cgroup v2 (`memory_max`) + log em `/data` |
 | 4 | Rootfs EROFS read-only + ZRAM no boot | boot de EROFS, `zram0` ativo | ✅ `/system` EROFS lz4 ro, `/data` ext4, zram = ½ RAM |
 | 5 | Orquestrador LangeDroid (Rust): namespaces + cgroup freezer, sem Android ainda | congela/descongela container de teste, mede RAM | ✅ `langedroid`; ocioso 9.2 MB → 0.3 MB |
-| 6 | Android real no container (imagem Waydroid/LineageOS) | app Android abre no QEMU | 🔄 init + sepolicy + service managers + zygote64 OK (10 min sem reboot); GPU virtio OK; bloqueio: hwcomposer exige compositor Wayland → etapa 7 |
-| 7 | Compositor Smithay + launcher mínima (virtio-gpu) | janela nativa + janela Android na tela | |
+| 6 | Android real no container (imagem Waydroid/LineageOS 20) | app Android abre no QEMU | ✅ boot completo em ~2,5 min; Launcher na tela (QEMU `GPU=virgl`) |
+| 7 | Compositor Smithay + launcher mínima (virtio-gpu) | janela nativa + janela Android na tela | 🔄 `lange-compositor` mostra o Android; falta input (toque), launcher nativa |
 | 8 | Primeiro aparelho físico | boot no hardware | |
 | 9 | Proxy de permissões, firewall eBPF, AVB | — | |
 | 10 | Integração com a distro Langeos desktop (`docs/INTEGRACAO-DESKTOP.md`) | pareamento + clipboard + notificações | planejado |
