@@ -26,7 +26,7 @@ use smithay::reexports::wayland_server::{Client, Display, ListeningSocket, Resou
 use smithay::utils::{Serial, Transform};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
-    with_states, with_surface_tree_downward, BufferAssignment, CompositorClientState, CompositorHandler,
+    with_states, with_surface_tree_downward, with_surface_tree_upward, BufferAssignment, CompositorClientState, CompositorHandler,
     CompositorState, SubsurfaceCachedState, SurfaceAttributes, TraversalAction,
 };
 use smithay::wayland::dmabuf::{get_dmabuf, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
@@ -384,7 +384,9 @@ impl App {
         let (fw, fh) = (screen.w, screen.h);
         let images = &self.images;
         for top in self.xdg.toplevel_surfaces() {
-            with_surface_tree_downward(
+            // upward = ordem de desenho (fundo -> frente). downward é a ordem de clique: com ele o
+            // fundo preto do hwcomposer do Waydroid era desenhado por último e cobria tudo.
+            with_surface_tree_upward(
                 top.wl_surface(),
                 (0, 0),
                 |_, states, &(x, y)| {
