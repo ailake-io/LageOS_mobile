@@ -7,7 +7,7 @@
 //! Protocolos: compositor+subcompositor, xdg_shell, shm, linux-dmabuf (linear), viewporter,
 //! presentation, output. É o que o hwcomposer do Waydroid (container LangeDroid) usa.
 use std::collections::HashMap;
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{env, fs, thread};
@@ -124,10 +124,41 @@ fn import_shm(buf: &wl_buffer::WlBuffer) -> Option<Image> {
     }).ok().flatten()
 }
 
-fn import_dmabuf(dmabuf: &Dmabuf) -> Option<Image> {
+// ---------- virtio-gpu (virgl): trazer o conteúdo da GPU do host antes de ler ----------
+
+unsafe extern "C" {
+    fn ioctl(fd: i32, request: std::ffi::c_ulong, ...) -> i32;
+}
+
+/// _IOWR('d', DRM_COMMAND_BASE + nr, size) — codificação genérica do Linux (arm64/x86).
+const fn drm_iowr(nr: u64, size: u64) -> std::ffi::c_ulong { ((3 << 30) | (size << 16) | ((b'd' as u64) << 8) | (0x40 + nr)) as _ }
+const VIRTGPU_TRANSFER_FROM_HOST: std::ffi::c_ulong = drm_iowr(0x06, 44);
+const VIRTGPU_WAIT: std::ffi::c_ulong = drm_iowr(0x08, 8);
+
+/// Com virgl o Android renderiza na GPU do host; a memória da guest só reflete o resultado após
+/// TRANSFER_FROM_HOST (o que o driver virgl da Mesa faz ao mapear). Em GPU real o ioctl falha
+/// (não é virtio) e nada muda. ponytail: transfere o quadro inteiro a cada commit.
+fn virtio_readback(card: &Card, dmabuf: &Dmabuf, w: u32, h: u32, stride: u32) {
+    use drm::control::Device as _;
+    let Some(fd) = dmabuf.handles().next() else { return };
+    let Ok(handle) = card.prime_fd_to_buffer(fd) else { return };
+    let bo: u32 = handle.into();
+    let mut xfer = [bo, 0, 0, 0, w, h, 1, 0, 0, stride, 0u32]; // handle, box{x,y,z,w,h,d}, level, offset, stride, layer_stride
+    let mut wait = [bo, 0u32];
+    let fd = card.0.as_fd().as_raw_fd();
+    unsafe {
+        if ioctl(fd, VIRTGPU_TRANSFER_FROM_HOST, xfer.as_mut_ptr()) == 0 {
+            ioctl(fd, VIRTGPU_WAIT, wait.as_mut_ptr());
+        }
+    }
+    let _ = card.close_buffer(handle);
+}
+
+fn import_dmabuf(dmabuf: &Dmabuf, card: Option<&Card>) -> Option<Image> {
     let (swap, alpha) = fourcc_info(dmabuf.format().code)?;
     let stride = dmabuf.strides().next()? as usize;
     let size = dmabuf.size();
+    if let Some(card) = card { virtio_readback(card, dmabuf, size.w as u32, size.h as u32, stride as u32); }
     let _ = dmabuf.sync_plane(0, DmabufSyncFlags::START | DmabufSyncFlags::READ);
     let map = dmabuf.map_plane(0, DmabufMappingMode::READ).ok()?;
     let img = read_pixels(map.ptr() as *const u8, map.length(), 0, size.w as usize, size.h as usize, stride, swap, alpha);
@@ -216,6 +247,8 @@ struct App {
     dirty: bool,
     size: (i32, i32),
     commits: u32,
+    /// fd DRM próprio (dup do card0) p/ o readback virtio; None em headless
+    card: Option<Card>,
 }
 
 impl BufferHandler for App { fn buffer_destroyed(&mut self, _b: &wl_buffer::WlBuffer) {} }
@@ -231,7 +264,7 @@ impl CompositorHandler for App {
         match assignment {
             Some(BufferAssignment::NewBuffer(buf)) => {
                 let kind = if get_dmabuf(&buf).is_ok() { "dmabuf" } else { "shm" };
-                let img = match get_dmabuf(&buf) { Ok(d) => import_dmabuf(d), Err(_) => import_shm(&buf) };
+                let img = match get_dmabuf(&buf) { Ok(d) => import_dmabuf(d, self.card.as_ref()), Err(_) => import_shm(&buf) };
                 // ponytail: log só dos primeiros commits (diagnóstico da etapa 7), sem inundar o console
                 if self.commits < 20 {
                     self.commits += 1;
@@ -398,6 +431,7 @@ fn main() {
         dirty: true,
         size: (screen.w as i32, screen.h as i32),
         commits: 0,
+        card: screen.drm.as_ref().and_then(|(c, _)| c.0.try_clone().ok()).map(Card),
     };
     let _ = &app.output;
 
@@ -471,6 +505,12 @@ mod tests {
         assert!(read_pixels(data.as_ptr(), 16, 0, 2, 2, 8, false, false).is_some());
         assert!(read_pixels(data.as_ptr(), 16, 4, 2, 2, 8, false, false).is_none()); // estoura
         assert!(read_pixels(data.as_ptr(), 16, 0, 2, 2, 4, false, false).is_none()); // stride < w*4
+    }
+    #[test]
+    fn virtgpu_ioctls() {
+        // conferidos com include/uapi/drm/virtgpu_drm.h (structs de 44 e 8 bytes)
+        assert_eq!(VIRTGPU_TRANSFER_FROM_HOST, 0xc02c6446);
+        assert_eq!(VIRTGPU_WAIT, 0xc0086448);
     }
     #[test]
     fn size_arg() { assert_eq!(parse_size("720x1280"), Some((720, 1280))); assert_eq!(parse_size("x"), None); }
