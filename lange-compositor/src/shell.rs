@@ -288,6 +288,20 @@ impl Shell {
         self.tap(x as i32, y as i32, w, h)
     }
 
+    pub fn pin_fails(&self) -> u32 { self.pin_fails }
+
+    /// Erros seguidos de PIN. A cada PIN_TRIES erros: espera que dobra (30 s, 1 min, 2 min... até 1 h).
+    /// Só zera com o PIN certo.
+    pub fn set_pin_fails(&mut self, n: u32) {
+        self.pin_fails = n;
+        // nova espera ao completar cada leva de erros, ou ao carregar a contagem salva (reinício)
+        if n >= PIN_TRIES && (n % PIN_TRIES == 0 || self.pin_wait_until.is_none()) {
+            let lockouts = n / PIN_TRIES; // 1, 2, 3...
+            let wait = PIN_WAIT.saturating_mul(1 << (lockouts - 1).min(7)).min(std::time::Duration::from_secs(3600));
+            self.pin_wait_until = Some(std::time::Instant::now() + wait);
+        }
+    }
+
     fn buttons_y() -> i32 { Self::slider_y(1) + 52 }
 
     fn open_pin(&mut self, step: PinStep) {
@@ -330,8 +344,7 @@ impl Shell {
                     self.pin_fails = 0;
                     if step == PinStep::Unlock { self.pin_step = None; self.mode = Mode::Home } else { self.open_pin(PinStep::New) }
                 } else {
-                    self.pin_fails += 1;
-                    if self.pin_fails >= PIN_TRIES { self.pin_fails = 0; self.pin_wait_until = Some(std::time::Instant::now() + PIN_WAIT); }
+                    self.set_pin_fails(self.pin_fails + 1);
                     self.pin_msg = "PIN incorreto";
                 }
                 Action::Redraw
@@ -739,12 +752,18 @@ mod tests {
         type_pin(&mut s, "2580");
         assert_eq!(s.mode, Mode::Home);
         assert!(s.pin_step.is_none());
-        // 5 erros: espera, mesmo com o PIN certo
+        // 5 erros: espera, mesmo com o PIN certo; a espera dobra
         s.mode = Mode::Locked;
         s.open_pin(PinStep::Unlock);
         for _ in 0..PIN_TRIES { type_pin(&mut s, "0000"); }
         type_pin(&mut s, "2580");
         assert_eq!(s.mode, Mode::Locked);
+        let left = |s: &Shell| s.pin_wait_until.unwrap().saturating_duration_since(std::time::Instant::now());
+        assert!(left(&s) > std::time::Duration::from_secs(25));
+        // reinício com 10 erros salvos: espera de 1 min já ativa
+        let mut r = Shell::new();
+        r.set_pin_fails(2 * PIN_TRIES);
+        assert!(left(&r) > std::time::Duration::from_secs(55));
     }
 
     #[test]

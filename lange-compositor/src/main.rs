@@ -204,6 +204,7 @@ mod shell;
 mod pin;
 const PIN_DIR: &str = "/data/lange";
 const PIN_FILE: &str = "/data/lange/pin";
+const PIN_FAILS_FILE: &str = "/data/lange/pin-fails";
 use shell::{Action, Canvas, Mode, Shell, BAR, NAV};
 
 /// "HH:MM" UTC. ponytail: sem fuso horário (sem tzdata no rootfs); ler TZ quando houver config de usuário.
@@ -768,6 +769,9 @@ fn main() {
     let _ = std::os::unix::fs::chown(PIN_DIR, Some(COMPOSITOR_UID), Some(COMPOSITOR_UID));
     let _ = fs::set_permissions(PIN_DIR, fs::Permissions::from_mode(0o700));
     app.shell.pin = pin::Pin::load(PIN_FILE);
+    // erros de PIN sobrevivem a reinício do compositor (senão reiniciar zerava a espera)
+    app.shell.set_pin_fails(fs::read_to_string(PIN_FAILS_FILE).ok().and_then(|t| t.trim().parse().ok()).unwrap_or(0));
+    let mut saved_fails = app.shell.pin_fails();
     let mut tablet = Tablet::open();
     if tablet.is_none() { eprintln!("[compositor] sem dispositivo de toque"); }
     drop_root();
@@ -811,6 +815,10 @@ fn main() {
                     if ev == TouchEv::Up { post_touch_at = Some(Instant::now() + Duration::from_secs(20)); }
                 }
                 app.touch(ev);
+                if app.shell.pin_fails() != saved_fails {
+                    saved_fails = app.shell.pin_fails();
+                    if let Err(e) = fs::write(PIN_FAILS_FILE, saved_fails.to_string()) { eprintln!("[compositor] erros de PIN: {e}"); }
+                }
             }
         }
         if clock_now() != minute { minute = clock_now(); app.dirty = true; }
@@ -857,7 +865,8 @@ fn main() {
             } else if req == "notifs" {
                 if !reply.starts_with("ok") { eprintln!("[compositor] notifs: {reply}"); }
                 if let Some(n) = shell::parse_notifs(&reply) { app.shell.notifs = n; app.dirty = true; }
-            } else if req == "key back" && reply == "ok home" {
+            } else if req == "key back" && reply == "ok home" && app.shell.mode == Mode::App && app.shell.pin_step.is_none() {
+                // resposta assíncrona: só sai do app; nunca tira da tela de bloqueio (Bloquear pode ter vindo antes)
                 app.shell.mode = Mode::Home; // saiu do app: tela inicial nativa, não a launcher do Android
                 app.dirty = true;
             } else if reply.starts_with("erro") {
