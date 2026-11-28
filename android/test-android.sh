@@ -23,6 +23,8 @@ while kill -0 $qpid 2>/dev/null; do
     # coordenadas em fração da tela (1280x800 no QEMU)
     python3 qmp.py "$Q" tap "$(python3 -c "print($x/1280)")" "$(python3 -c "print($y/800)")" && touched=1
     sleep 30  # compositor grava screen-post-touch.ppm 20 s após soltar (com fsync) + commit do ext4
+    # pinça (2 dedos) na Galeria: zoom
+    python3 qmp.py "$Q" pinch 0.5 0.5 0.1 0.5 && sleep 5
     # Voltar nativo (◁ da barra de navegação, x = meio - 140) na 1ª tela da Galeria -> tela inicial nativa
     python3 qmp.py "$Q" tap "$(python3 -c "print((640-140)/1280)")" "$(python3 -c "print(776/800)")"
     for _ in $(seq 24); do grep -aq 'key back -> ok home' build/boot.log && break; sleep 5; done
@@ -71,6 +73,7 @@ n=min(len(a),len(b))//3; print(sum(1 for i in range(0,n*3,3) if a[i:i+3]!=b[i:i+
   grep -aq 'teclado virtual sempre visível' build/boot.log && echo "OK    teclado virtual do Android habilitado" || { echo "FALTA teclado virtual habilitado"; fail=1; }
   grep -aq 'langedroid\] notifs -> ok' build/boot.log && echo "OK    painel rápido leu as notificações do Android" || { echo "FALTA painel rápido ler notificações"; fail=1; }
   grep -aqE 'compositor\] [1-9][0-9]* ícones do Android' build/boot.log && echo "OK    ícones reais dos apps ($(grep -aoE '[0-9]+ ícones do Android' build/boot.log | tail -1))" || { echo "FALTA ícones reais dos apps"; fail=1; }
+  grep -aq 'compositor\] multitouch: 2 dedos -> Android' build/boot.log && echo "OK    multitouch chega ao Android (2 dedos)" || { echo "FALTA multitouch"; fail=1; }
   grep -aq 'langedroid\] volume 15 -> ok' build/boot.log && echo "OK    volume do painel chega ao Android" || { echo "FALTA volume do painel"; fail=1; }
   grep -aq 'langedroid\] net -> ok on' build/boot.log && echo "OK    barra de status vê a rede do Android" || { echo "FALTA indicador de rede"; fail=1; }
   grep -aq 'key back -> ok home' build/boot.log && echo "OK    voltar no app volta à tela inicial nativa" || { echo "FALTA voltar no app voltar à tela inicial nativa"; fail=1; }

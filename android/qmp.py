@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Controle mínimo do QEMU por QMP p/ testes: toque (virtio-tablet) e screendump.
-  qmp.py SOCK screendump ARQ.ppm | swipe X0 Y0 X1 Y1 | tap X Y | quit
+"""Controle mínimo do QEMU por QMP p/ testes: toque (virtio-multitouch) e screendump.
+  qmp.py SOCK screendump ARQ.ppm | swipe X0 Y0 X1 Y1 | tap X Y | pinch X Y D0 D1 | quit
 Coordenadas em fração da tela (0..1)."""
 import json, socket, sys, time
 
@@ -14,18 +14,26 @@ def cmd(name, **args):
             return r["return"]
 f.readline(); cmd("qmp_capabilities")
 
-def abs_ev(x, y): return [{"type": "abs", "data": {"axis": "x", "value": int(x * 32767)}},
-                          {"type": "abs", "data": {"axis": "y", "value": int(y * 32767)}}]
-def btn(down): return [{"type": "btn", "data": {"down": down, "button": "left"}}]
+# virtio-multitouch (QEMU): begin/update escolhem o dedo (ABS_MT_SLOT + TRACKING_ID); a posição vai em
+# eventos "data" (ABS_MT_POSITION_* do slot atual); end solta (tracking-id -1).
+def mt(kind, slot, x=0, y=0):
+    d = lambda k, tid, axis, v: {"type": "mtt", "data": {"type": k, "slot": slot, "tracking-id": tid, "axis": axis, "value": int(v * 32767)}}
+    if kind == "end": return [d("end", -1, "x", 0)]
+    return [d(kind, slot + 1, "x", 0), d("data", slot + 1, "x", x), d("data", slot + 1, "y", y)]
+def drag(paths):  # paths: [(x0, y0, x1, y1)] um por dedo, juntos em 10 passos (~0.5 s)
+    cmd("input-send-event", events=sum((mt("begin", i, p[0], p[1]) for i, p in enumerate(paths)), []))
+    for k in range(1, 11):
+        time.sleep(0.05)
+        cmd("input-send-event", events=sum((mt("update", i, p[0] + (p[2] - p[0]) * k / 10, p[1] + (p[3] - p[1]) * k / 10) for i, p in enumerate(paths)), []))
+    cmd("input-send-event", events=sum((mt("end", i) for i in range(len(paths))), []))
 
 op, a = sys.argv[2], [float(v) for v in sys.argv[3:]] if sys.argv[2] != "screendump" else sys.argv[3:]
 if op == "screendump": cmd("screendump", filename=a[0])
 elif op == "quit": cmd("quit")
 elif op == "tap":  # sem passos intermediários: no QEMU 0.5 s já vira toque longo
-    cmd("input-send-event", events=abs_ev(*a) + btn(True)); cmd("input-send-event", events=btn(False))
+    cmd("input-send-event", events=mt("begin", 0, *a)); cmd("input-send-event", events=mt("end", 0))
+elif op == "pinch":  # pinch X Y D0 D1: dois dedos na horizontal, distância D0 -> D1 (zoom se D1 > D0)
+    x, y, d0, d1 = a
+    drag([(x - d0 / 2, y, x - d1 / 2, y), (x + d0 / 2, y, x + d1 / 2, y)])
 else:
-    x0, y0, x1, y1 = a
-    cmd("input-send-event", events=abs_ev(x0, y0)); cmd("input-send-event", events=btn(True))
-    for i in range(1, 11):  # 10 passos em ~0.5 s
-        time.sleep(0.05); cmd("input-send-event", events=abs_ev(x0 + (x1 - x0) * i / 10, y0 + (y1 - y0) * i / 10))
-    cmd("input-send-event", events=btn(False))
+    drag([a])

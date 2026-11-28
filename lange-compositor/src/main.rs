@@ -215,32 +215,45 @@ fn clock_now() -> String {
 
 // ---------- input: evdev (toque / tablet absoluto) ----------
 
+/// Evento de toque por dedo (slot 0..SLOTS).
 #[derive(Debug, PartialEq, Clone, Copy)]
-enum TouchEv { Down(f64, f64), Motion(f64, f64), Up }
+enum TouchEv { Down(usize, f64, f64), Motion(usize, f64, f64), Up(usize) }
 
-/// Dispositivo evdev absoluto (virtio-tablet no QEMU, touchscreen single-touch no aparelho).
-/// ponytail: single-touch (ABS_X/ABS_Y + BTN_TOUCH/BTN_LEFT); multitouch (ABS_MT_*) depois.
-struct Tablet { file: fs::File, max: (i32, i32), pos: (i32, i32), down: bool, moved: bool, was_down: bool }
+const SLOTS: usize = 10;
+
+#[derive(Clone, Copy, Default)]
+struct Slot { id: i32, x: i32, y: i32, was: bool, moved: bool }
+
+/// Dispositivo evdev absoluto: multitouch (protocolo B, ABS_MT_*: touchscreen real, virtio-multitouch)
+/// ou single-touch (ABS_X/ABS_Y + BTN_TOUCH/BTN_LEFT: virtio-tablet), este como slot 0.
+struct Tablet { file: fs::File, max: (i32, i32), mt: bool, slots: [Slot; SLOTS], cur: usize }
 
 const EV_SYN: u16 = 0; const EV_KEY: u16 = 1; const EV_ABS: u16 = 3;
 const BTN_LEFT: u16 = 0x110; const BTN_TOUCH: u16 = 0x14a;
+const ABS_MT_SLOT: u16 = 0x2f; const ABS_MT_POSITION_X: u16 = 0x35; const ABS_MT_POSITION_Y: u16 = 0x36; const ABS_MT_TRACKING_ID: u16 = 0x39;
 
 /// EVIOCGABS(abs) = _IOR('E', 0x40 + abs, struct input_absinfo /* 24 bytes */)
 const fn eviocgabs(abs: u64) -> std::ffi::c_ulong { ((2 << 30) | (24 << 16) | ((b'E' as u64) << 8) | (0x40 + abs)) as _ }
 
 impl Tablet {
-    /// Primeiro /dev/input/event* com eixos X e Y absolutos.
+    fn new(file: fs::File, max: (i32, i32), mt: bool) -> Tablet {
+        Tablet { file, max, mt, slots: [Slot { id: -1, ..Default::default() }; SLOTS], cur: 0 }
+    }
+
+    /// Primeiro /dev/input/event* com eixos absolutos (MT preferido, senão X/Y).
     fn open() -> Option<Tablet> {
         use std::os::unix::fs::OpenOptionsExt;
         let mut names: Vec<_> = fs::read_dir("/dev/input").ok()?.flatten().map(|e| e.path()).collect();
         names.sort();
         for path in names.into_iter().filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("event"))) {
             let Ok(file) = fs::OpenOptions::new().read(true).custom_flags(0o4000 /* O_NONBLOCK */).open(&path) else { continue };
-            let max = |abs| { let mut info = [0i32; 6]; (unsafe { ioctl(file.as_raw_fd(), eviocgabs(abs), info.as_mut_ptr()) } == 0).then_some(info[2]) };
-            if let (Some(mx), Some(my)) = (max(0), max(1)) && mx > 0 && my > 0 {
-                eprintln!("[compositor] input {} (abs {mx}x{my})", path.display());
-                return Some(Tablet { file, max: (mx, my), pos: (0, 0), down: false, moved: false, was_down: false });
-            }
+            let max = |abs: u16| { let mut info = [0i32; 6]; (unsafe { ioctl(file.as_raw_fd(), eviocgabs(abs as u64), info.as_mut_ptr()) } == 0 && info[2] > 0).then_some(info[2]) };
+            let (mt, axes) = match (max(ABS_MT_POSITION_X), max(ABS_MT_POSITION_Y)) {
+                (Some(x), Some(y)) => (true, (x, y)),
+                _ => match (max(0), max(1)) { (Some(x), Some(y)) => (false, (x, y)), _ => continue },
+            };
+            eprintln!("[compositor] input {} (abs {}x{}, {})", path.display(), axes.0, axes.1, if mt { "multitouch" } else { "1 toque" });
+            return Some(Tablet::new(file, axes, mt));
         }
         None
     }
@@ -267,21 +280,27 @@ impl Tablet {
         let ty = u16::from_le_bytes([ev[16], ev[17]]);
         let code = u16::from_le_bytes([ev[18], ev[19]]);
         let val = i32::from_le_bytes([ev[20], ev[21], ev[22], ev[23]]);
-        match (ty, code) {
-            (EV_ABS, 0) => { self.pos.0 = val; self.moved = true; }
-            (EV_ABS, 1) => { self.pos.1 = val; self.moved = true; }
-            (EV_KEY, BTN_LEFT | BTN_TOUCH) => self.down = val != 0,
-            (EV_SYN, 0) => {
-                let x = self.pos.0.clamp(0, self.max.0) as f64 * sw as f64 / (self.max.0 as f64 + 1.0);
-                let y = self.pos.1.clamp(0, self.max.1) as f64 * sh as f64 / (self.max.1 as f64 + 1.0);
-                match (self.was_down, self.down) {
-                    (false, true) => out.push(TouchEv::Down(x, y)),
-                    (true, false) => out.push(TouchEv::Up),
-                    (true, true) if self.moved => out.push(TouchEv::Motion(x, y)),
-                    _ => {}
+        let cur = self.cur;
+        match (ty, code, self.mt) {
+            (EV_ABS, ABS_MT_SLOT, true) => self.cur = (val.max(0) as usize).min(SLOTS - 1),
+            (EV_ABS, ABS_MT_TRACKING_ID, true) => self.slots[cur].id = val,
+            (EV_ABS, ABS_MT_POSITION_X, true) | (EV_ABS, 0, false) => { self.slots[cur].x = val; self.slots[cur].moved = true; }
+            (EV_ABS, ABS_MT_POSITION_Y, true) | (EV_ABS, 1, false) => { self.slots[cur].y = val; self.slots[cur].moved = true; }
+            (EV_KEY, BTN_LEFT | BTN_TOUCH, false) => self.slots[0].id = if val != 0 { 0 } else { -1 },
+            (EV_SYN, 0, _) => {
+                for (i, s) in self.slots.iter_mut().enumerate() {
+                    let x = s.x.clamp(0, self.max.0) as f64 * sw as f64 / (self.max.0 as f64 + 1.0);
+                    let y = s.y.clamp(0, self.max.1) as f64 * sh as f64 / (self.max.1 as f64 + 1.0);
+                    let down = s.id >= 0;
+                    match (s.was, down) {
+                        (false, true) => out.push(TouchEv::Down(i, x, y)),
+                        (true, false) => out.push(TouchEv::Up(i)),
+                        (true, true) if s.moved => out.push(TouchEv::Motion(i, x, y)),
+                        _ => {}
+                    }
+                    s.was = down;
+                    s.moved = false;
                 }
-                self.was_down = self.down;
-                self.moved = false;
             }
             _ => {}
         }
@@ -406,6 +425,10 @@ struct App {
     import_time: Duration,
     shell: Shell,
     touch_shell: bool,
+    /// dedos na tela agora e o slot do dedo que o shell acompanha
+    fingers: usize,
+    mt_logged: bool,
+    shell_slot: usize,
     touch_pos: (f64, f64),
     /// pedidos p/ o langedroid (socket do shell), enviados pela thread `shell_client`
     requests: Vec<String>,
@@ -585,16 +608,24 @@ impl App {
 
     /// Toque: barras e tela inicial/recentes são do shell; o resto vai p/ a janela Android.
     /// Quem recebe é decidido no `down` e vale até o `up`.
+    /// Destino decidido pelo 1º dedo; os outros seguem o mesmo (Android recebe todos; shell só o 1º).
     fn touch(&mut self, ev: TouchEv) {
         let (w, h) = (self.size.0 as usize, self.size.1 as usize);
-        if let TouchEv::Down(x, y) = ev {
+        let first = self.fingers == 0;
+        match ev {
+            TouchEv::Down(..) => self.fingers += 1,
+            TouchEv::Up(_) => self.fingers = self.fingers.saturating_sub(1),
+            _ => {}
+        }
+        if let TouchEv::Down(slot, x, y) = ev && first {
             self.touch_shell = self.surface_at(x, y).is_none();
+            self.shell_slot = slot;
             if self.touch_shell { self.shell.touch_down(x, y); }
             self.touch_pos = (x, y);
         }
-        if let TouchEv::Motion(x, y) = ev { self.touch_pos = (x, y); }
         if !self.touch_shell { return self.touch_android(ev); }
-        if ev == TouchEv::Up {
+        if let TouchEv::Motion(s, x, y) = ev && s == self.shell_slot { self.touch_pos = (x, y); }
+        if ev == TouchEv::Up(self.shell_slot) {
             let (x, y) = self.touch_pos;
             let action = self.shell.touch_up(x, y, w, h);
             if action != Action::None { eprintln!("[compositor] shell {action:?} (modo {:?}, painel {})", self.shell.mode, self.shell.panel); }
@@ -618,20 +649,25 @@ impl App {
     fn touch_android(&mut self, ev: TouchEv) {
         let Some(t) = self.seat.get_touch() else { return };
         let time = self.start.elapsed().as_millis() as u32;
-        // id 0: None vira -1 no wl_touch, e o hwcomposer repassa como ABS_MT_TRACKING_ID -1 (= dedo solto)
-        let slot = smithay::backend::input::TouchSlot::from(Some(0));
+        // id = slot do dedo; nunca None: None vira -1 no wl_touch, e o hwcomposer repassa como
+        // ABS_MT_TRACKING_ID -1 (= dedo solto)
+        let id = |s: usize| smithay::backend::input::TouchSlot::from(Some(s as u32));
         match ev {
-            TouchEv::Down(x, y) => {
-                let focus = self.surface_at(x, y);
+            TouchEv::Down(s, x, y) => {
+                let slot = id(s);
+                if self.fingers == 2 && !self.mt_logged { self.mt_logged = true; eprintln!("[compositor] multitouch: 2 dedos -> Android"); }
+                // 2º dedo em diante: mesma janela do 1º (coordenadas locais dela)
+                let focus = if self.fingers > 1 && self.touch_focus.is_some() { self.touch_focus.clone() } else { self.surface_at(x, y) };
                 self.touch_focus = focus.clone();
                 t.down(self, focus, &touch::DownEvent { slot, location: (x, y).into(), serial: SERIAL_COUNTER.next_serial(), time });
             }
-            TouchEv::Motion(x, y) => {
-                let focus = self.touch_focus.clone();
+            TouchEv::Motion(s, x, y) => {
+                let (slot, focus) = (id(s), self.touch_focus.clone());
                 t.motion(self, focus, &touch::MotionEvent { slot, location: (x, y).into(), time });
             }
-            TouchEv::Up => {
-                self.touch_focus = None;
+            TouchEv::Up(s) => {
+                let slot = id(s);
+                if self.fingers == 0 { self.touch_focus = None; }
                 t.up(self, &touch::UpEvent { slot, serial: SERIAL_COUNTER.next_serial(), time });
             }
         }
@@ -754,7 +790,7 @@ fn main() {
         frame_seq: 0,
         import_time: Duration::ZERO,
         shell: Shell::new(),
-        touch_shell: false,
+        touch_shell: false, fingers: 0, mt_logged: false, shell_slot: 0,
         touch_pos: (0.0, 0.0),
         requests: Vec::new(),
     };
@@ -827,7 +863,7 @@ fn main() {
                         let _ = screen.screenshot(&p.replace(".ppm", "-pre-touch.ppm"));
                     }
                     // QEMU: Android reage devagar
-                    if ev == TouchEv::Up { post_touch_at = Some(Instant::now() + Duration::from_secs(20)); }
+                    if matches!(ev, TouchEv::Up(_)) { post_touch_at = Some(Instant::now() + Duration::from_secs(20)); }
                 }
                 app.touch(ev);
                 if app.shell.pin_fails() != saved_fails {
@@ -968,13 +1004,21 @@ mod tests {
     fn tablet_events() {
         let ev = |ty: u16, code: u16, val: i32| { let mut b = [0u8; 24]; b[16..18].copy_from_slice(&ty.to_le_bytes());
             b[18..20].copy_from_slice(&code.to_le_bytes()); b[20..24].copy_from_slice(&val.to_le_bytes()); b };
-        let file = fs::File::open("/dev/null").unwrap();
-        let mut t = Tablet { file, max: (32767, 32767), pos: (0, 0), down: false, moved: false, was_down: false };
+        let mut t = Tablet::new(fs::File::open("/dev/null").unwrap(), (32767, 32767), false);
         let mut out = Vec::new();
         for e in [ev(EV_ABS, 0, 16384), ev(EV_ABS, 1, 0), ev(EV_KEY, BTN_LEFT, 1), ev(EV_SYN, 0, 0),
                   ev(EV_ABS, 1, 32767), ev(EV_SYN, 0, 0), ev(EV_KEY, BTN_LEFT, 0), ev(EV_SYN, 0, 0),
                   ev(EV_ABS, 0, 1), ev(EV_SYN, 0, 0)] { t.feed(&e, 720, 1280, &mut out); }
-        assert_eq!(out, [TouchEv::Down(360.0, 0.0), TouchEv::Motion(360.0, 1279.9609375), TouchEv::Up]); // movimento sem toque: nada
+        assert_eq!(out, [TouchEv::Down(0, 360.0, 0.0), TouchEv::Motion(0, 360.0, 1279.9609375), TouchEv::Up(0)]); // movimento sem toque: nada
+        // multitouch: dois dedos, solta o 2º, depois o 1º
+        let mut t = Tablet::new(fs::File::open("/dev/null").unwrap(), (999, 999), true);
+        let mut out = Vec::new();
+        for e in [ev(EV_ABS, ABS_MT_SLOT, 0), ev(EV_ABS, ABS_MT_TRACKING_ID, 7), ev(EV_ABS, ABS_MT_POSITION_X, 0), ev(EV_ABS, ABS_MT_POSITION_Y, 0),
+                  ev(EV_ABS, ABS_MT_SLOT, 1), ev(EV_ABS, ABS_MT_TRACKING_ID, 8), ev(EV_ABS, ABS_MT_POSITION_X, 500), ev(EV_ABS, ABS_MT_POSITION_Y, 500), ev(EV_SYN, 0, 0),
+                  ev(EV_ABS, ABS_MT_POSITION_X, 600), ev(EV_SYN, 0, 0),
+                  ev(EV_ABS, ABS_MT_TRACKING_ID, -1), ev(EV_SYN, 0, 0),
+                  ev(EV_ABS, ABS_MT_SLOT, 0), ev(EV_ABS, ABS_MT_TRACKING_ID, -1), ev(EV_SYN, 0, 0)] { t.feed(&e, 1000, 1000, &mut out); }
+        assert_eq!(out, [TouchEv::Down(0, 0.0, 0.0), TouchEv::Down(1, 500.0, 500.0), TouchEv::Motion(1, 600.0, 500.0), TouchEv::Up(1), TouchEv::Up(0)]);
     }
     #[test]
     fn size_arg() { assert_eq!(parse_size("720x1280"), Some((720, 1280))); assert_eq!(parse_size("x"), None); }
