@@ -2,6 +2,7 @@
 # Boot LangeOS no QEMU aarch64: kernel próprio + /system EROFS read-only (vda) + /data ext4 persistente (vdb).
 # Sair do QEMU: Ctrl-A depois X.  Uso: [MEM=MB] [SMP=n] [POWEROFF=s] [QUIET=] [ANDROID=1] ./run.sh [segundos_timeout]
 # GPU=virgl: GPU 3D do host via virglrenderer (QEMU do apt, -display egl-headless). Padrão: 2D + Mesa em software.
+# VNC=n: tela em VNC na porta 5900+n (ex.: VNC=1 -> vncviewer :1), mouse vira toque.
 # ANDROID=1: + system/vendor do Waydroid (../android/fetch.sh) e container Android aberto no boot.
 # Apagar build/data.img zera os dados persistentes.
 set -euo pipefail
@@ -29,6 +30,8 @@ if [ "${GPU:-}" = virgl ]; then
   QEMU=/usr/bin/qemu-system-aarch64  # QEMU do Ubuntu tem virglrenderer; o do Homebrew não
   GPU_DEV=(-device virtio-gpu-gl-device -display egl-headless -device virtio-multitouch-device -netdev user,id=net0 -device virtio-net-device,netdev=net0)
 fi
+# VNC manda o mouse como ponteiro absoluto, que o multitouch ignora: tablet no lugar (um dedo só)
+[ -n "${VNC:-}" ] && GPU_DEV=("${GPU_DEV[@]/virtio-multitouch-device/virtio-tablet-device}")
 if [ -n "${ANDROID:-}" ]; then
   A=../android/build
   [ -f $A/system.img ] && [ -f $A/vendor.img ] || { echo "falta imagem Android: rode ../android/fetch.sh" >&2; exit 1; }
@@ -60,7 +63,8 @@ if [ -n "${ANDROID:-}" ]; then
   # navegação é do shell do LangeOS (◁ ○ □): sem a barra de navegação do Android (prop de aparelho com botões físicos)
   GFX_PROPS+='--prop qemu.hw.mainkeys=1 '
   # virtio-gpu sem virgl não tem driver Mesa 3D: força kms_swrast/llvmpipe (env da Mesa vira prop debug.mesa.* no Android)
-  [ "${GPU:-}" = virgl ] || GFX_PROPS+='--prop debug.mesa.loader.driver.override=kms_swrast --prop debug.mesa.gbm.always.software=true --prop debug.mesa.libgl.always.software=true '
+  # (prime_shader_cache=0: o pré-cache de shaders do SurfaceFlinger aborta com "output buffer not gpu writeable" no gralloc em software)
+  [ "${GPU:-}" = virgl ] || GFX_PROPS+='--prop debug.mesa.loader.driver.override=kms_swrast --prop debug.mesa.gbm.always.software=true --prop debug.mesa.libgl.always.software=true --prop service.sf.prime_shader_cache=0 '
   printf 'exec=/bin/langedroid daemon --rootfs /android/root --idle-freeze %s %s%s--wayland-dir /run/lange --payload /system/bin/init selinux_setup\n' "${IDLE_FREEZE:-30}" "${DEBUG_LOGCAT:+--debug-logcat }" "$GFX_PROPS" > "$S/20-langedroid.svc"
   printf 'exec=/bin/langedroid ctl open\nrestart=never\n' > "$S/30-android-open.svc"
   MEM=${MEM:-3072}
@@ -84,7 +88,7 @@ mkfs.erofs --quiet -zlz4 --all-root "$OUT/system.erofs" "$R" >/dev/null
 
 # virtio-mmio moderno (1.0): virtio-gpu recusa o transporte legado em silêncio.
 # virtio-mmio no virt enumera ao contrário: último -device vira vda. Por isso data antes de system.
-${1:+timeout $1} $QEMU -M virt -cpu cortex-a53 -smp "${SMP:-4}" -m "${MEM:-1024}" -nographic -no-reboot \
+${1:+timeout $1} $QEMU -M virt -cpu cortex-a53 -smp "${SMP:-4}" -m "${MEM:-1024}" -nographic ${VNC:+-vnc :$VNC} -no-reboot \
   -global virtio-mmio.force-legacy=false \
   -kernel "$KERNEL" "${DISKS[@]}" ${QMP:+-qmp unix:$QMP,server=on,wait=off} \
   -drive file="$OUT/data.img",format=raw,if=none,id=data -device virtio-blk-device,drive=data \

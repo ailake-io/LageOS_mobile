@@ -338,7 +338,7 @@ impl AsFd for Card { fn as_fd(&self) -> BorrowedFd<'_> { self.0.as_fd() } }
 impl drm::Device for Card {}
 impl drm::control::Device for Card {}
 
-struct Screen { w: usize, h: usize, fb: Vec<u32>, drm: Option<(Card, drm::control::dumbbuffer::DumbBuffer)> }
+struct Screen { w: usize, h: usize, fb: Vec<u32>, drm: Option<(Card, drm::control::dumbbuffer::DumbBuffer, drm::control::framebuffer::Handle)> }
 
 impl Screen {
     fn open(want: Option<(usize, usize)>) -> Screen {
@@ -369,14 +369,14 @@ impl Screen {
         card.set_crtc(crtc, Some(fb), (0, 0), &[conn.handle()], Some(mode)).map_err(|e| format!("set_crtc: {e}"))?;
         { let mut m = card.map_dumb_buffer(&mut db).map_err(|e| format!("map: {e}"))?; m.as_mut().fill(0); }
         eprintln!("[compositor] DRM card0 {w}x{h}");
-        Ok(Screen { w: w as usize, h: h as usize, fb: vec![0; w as usize * h as usize], drm: Some((card, db)) })
+        Ok(Screen { w: w as usize, h: h as usize, fb: vec![0; w as usize * h as usize], drm: Some((card, db, fb)) })
     }
 
     /// Copia o framebuffer da CPU p/ o dumb buffer (scanout). ponytail: buffer único (pode rasgar); page flip depois.
     fn present(&mut self) {
         use drm::buffer::Buffer as _;
         use drm::control::Device as _;
-        let Some((card, db)) = &mut self.drm else { return };
+        let Some((card, db, fb)) = &mut self.drm else { return };
         let pitch = db.pitch() as usize;
         let Ok(mut m) = card.map_dumb_buffer(db) else { return };
         let out = m.as_mut();
@@ -384,6 +384,12 @@ impl Screen {
         let src = unsafe { std::slice::from_raw_parts(self.fb.as_ptr() as *const u8, self.fb.len() * 4) };
         for y in 0..self.h {
             out[y * pitch..y * pitch + self.w * 4].copy_from_slice(&src[y * self.w * 4..(y + 1) * self.w * 4]);
+        }
+        drop(m);
+        // virtio-gpu (e outras GPUs sem scanout direto da memória) só atualizam a tela com DIRTYFB
+        if let Err(e) = card.dirty_framebuffer(*fb, &[drm::control::ClipRect::new(0, 0, self.w as u16, self.h as u16)]) {
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| eprintln!("[compositor] dirtyfb: {e}"));
         }
     }
 
@@ -783,7 +789,7 @@ fn main() {
         dirty: true,
         size: (screen.w as i32, screen.h as i32),
         commits: 0,
-        card: screen.drm.as_ref().and_then(|(c, _)| c.0.try_clone().ok()).map(Card),
+        card: screen.drm.as_ref().and_then(|(c, _, _)| c.0.try_clone().ok()).map(Card),
         seat,
         touch_focus: None,
         start: Instant::now(),
