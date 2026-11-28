@@ -607,14 +607,15 @@ impl Container {
             }
             "launch" if valid_component(arg) => self.android_cmd(&["activity", "start-activity", "-n", arg]).map(|_| String::new()),
             "key" => match arg {
+                // --async: não espera o app tratar a tecla (app ocupado/ANR travava o cmd até o timeout)
                 // Voltar na 1ª tela do app leva p/ a launcher do Android: avisa o shell ("home") p/ ele
                 // mostrar a tela inicial nativa no lugar.
-                "back" => self.android_cmd(&["input", "keyevent", "4"]).map(|_| {
+                "back" => self.android_cmd(&["input", "keyevent", "--async", "4"]).map(|_| {
                     thread::sleep(Duration::from_millis(800));
                     let top = self.android_run("/system/bin/dumpsys", &["activity", "activities"]).unwrap_or_default();
                     if top_is_home(&top) { "home".into() } else { String::new() }
                 }),
-                "home" => self.android_cmd(&["input", "keyevent", "3"]).map(|_| String::new()),
+                "home" => self.android_cmd(&["input", "keyevent", "--async", "3"]).map(|_| String::new()),
                 _ => Err("tecla desconhecida".into()),
             },
             _ => Err(format!("comando do shell inválido: {line}")),
