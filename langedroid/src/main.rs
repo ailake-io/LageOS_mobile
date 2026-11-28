@@ -635,6 +635,8 @@ impl Container {
             "icons" if arg.split(' ').skip(1).all(valid_component) && arg.split(' ').next().and_then(|n| n.parse::<u16>().ok()).is_some_and(|n| (16..=256).contains(&n)) => {
                 self.icons(arg)
             }
+            // fecha o app (recentes do shell): para o processo do pacote
+            "stop" if valid_component(arg) => self.android_cmd(&["activity", "force-stop", arg.split('/').next().unwrap_or(arg)]).map(|_| String::new()),
             "launch" if valid_component(arg) => self.android_cmd(&["activity", "start-activity", "-n", arg]).map(|_| String::new()),
             "key" => match arg {
                 // tecla pelo FIFO de teclado do Waydroid (o Android lê como teclado físico). `cmd input

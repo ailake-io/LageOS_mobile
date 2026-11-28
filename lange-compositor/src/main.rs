@@ -647,6 +647,7 @@ impl App {
                     self.dirty = true;
                 }
                 Action::Volume(v) => { self.requests.push(format!("volume {v}")); self.dirty = true; }
+                Action::Close(c) => { self.requests.push(format!("stop {c}")); self.dirty = true; }
             }
         }
     }

@@ -25,7 +25,7 @@ impl AppEntry {
 
 /// O que o compositor deve fazer depois de um toque no shell.
 #[derive(Debug, PartialEq)]
-pub enum Action { None, Redraw, Launch(String), Key(&'static str), Notifs, Volume(u8), SavePin }
+pub enum Action { None, Redraw, Launch(String), Key(&'static str), Notifs, Volume(u8), SavePin, Close(String) }
 
 /// Nome curto a partir do pacote: com.android.gallery3d -> "Gallery". ponytail: sem o rótulo real do
 /// APK (precisaria ler resources.arsc); trocar quando o langedroid devolver o label.
@@ -284,6 +284,13 @@ impl Shell {
             self.page = page;
             return Action::Redraw;
         }
+        // recentes: arrastar um cartão p/ cima fecha o app
+        if self.mode == Mode::Recents && swipe && dy < -80.0 && dy.abs() > dx.abs() {
+            let inside = |&(cx, cy, cw, ch): &(i32, i32, i32, i32)| (cx..cx + cw).contains(&(sx as i32)) && (cy..cy + ch).contains(&(sy as i32));
+            if let Some(i) = self.cards(w, h).iter().position(inside) {
+                return Action::Close(self.recents.remove(i));
+            }
+        }
         if swipe { return Action::None; }
         self.tap(x as i32, y as i32, w, h)
     }
@@ -490,6 +497,11 @@ impl Shell {
                     let tw = self.font.width(msg, 20);
                     self.font.draw(c, (w as i32 - tw) / 2, (top + bottom) / 2, 20, FG_DIM, msg);
                 }
+                else {
+                    let msg = "Deslize um app para cima para fechar";
+                    let tw = self.font.width(msg, 16);
+                    self.font.draw(c, (w as i32 - tw) / 2, bottom - 24, 16, FG_DIM, msg);
+                }
                 for (i, (x, y, cw, ch)) in self.cards(w, h).into_iter().enumerate() {
                     let comp = self.recents[i].clone();
                     let app = self.app_by_component(&comp).cloned().unwrap_or_else(|| AppEntry::new(&comp));
@@ -671,6 +683,13 @@ mod tests {
         assert_eq!(s.mode, Mode::Recents);
         let (x, y, cw, ch) = s.cards(w, h)[0];
         assert_eq!(s.tap(x + cw / 2, y + ch / 2, w, h), Action::Launch("d.e/.F".into()));
+        // recentes: arrastar cartão p/ cima fecha o app
+        s.mode = Mode::Recents;
+        let (cx, cy, cw, ch) = s.cards(w, h)[0];
+        let (mx, my) = ((cx + cw / 2) as f64, (cy + ch / 2) as f64);
+        s.touch_down(mx, my);
+        assert_eq!(s.touch_up(mx, my - 200.0, w, h), Action::Close("d.e/.F".into()));
+        assert!(s.recents.is_empty());
         // arrasto não é toque
         s.mode = Mode::Home;
         s.touch_down(10.0, 100.0);

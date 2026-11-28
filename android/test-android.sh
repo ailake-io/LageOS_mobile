@@ -33,6 +33,11 @@ while kill -0 $qpid 2>/dev/null; do
     # volume no máximo: fim da linha do controle (y = barra 32 + 120 + 48)
     python3 qmp.py "$Q" tap 0.99 "$(python3 -c "print(200/800)")"
     for _ in $(seq 24); do grep -aq 'langedroid\] volume 15 ->' build/boot.log && break; sleep 5; done
+    # recentes (□, x = meio + 140) e arrastar o cartão da Galeria p/ cima fecha o app
+    python3 qmp.py "$Q" swipe 0.5 0.6 0.5 0.1 && sleep 2  # fecha o painel
+    python3 qmp.py "$Q" tap "$(python3 -c "print((640+140)/1280)")" "$(python3 -c "print(776/800)")" && sleep 2
+    python3 qmp.py "$Q" swipe 0.5 "$(python3 -c "print(252/800)")" 0.5 0.1
+    for _ in $(seq 24); do grep -aq 'langedroid\] stop ' build/boot.log && break; sleep 5; done
     python3 qmp.py "$Q" quit 2>/dev/null; break
   fi
   sleep 5
@@ -75,6 +80,10 @@ n=min(len(a),len(b))//3; print(sum(1 for i in range(0,n*3,3) if a[i:i+3]!=b[i:i+
   grep -aq 'compositor\] multitouch: 2 dedos -> Android' build/boot.log && echo "OK    multitouch chega ao Android (2 dedos)" || { echo "FALTA multitouch"; fail=1; }
   grep -aq 'langedroid\] volume 15 -> ok' build/boot.log && echo "OK    volume do painel chega ao Android" || { echo "FALTA volume do painel"; fail=1; }
   grep -aq 'langedroid\] net -> ok on' build/boot.log && echo "OK    barra de status vê a rede do Android" || { echo "FALTA indicador de rede"; fail=1; }
+  grep -aq 'langedroid\] stop com.android.gallery3d/[^ ]* -> ok' build/boot.log && echo "OK    recentes fecham o app (deslizar p/ cima)" || { echo "FALTA recentes fecharem o app"; fail=1; }
+  # app desenhou: o Android mandou quadros (commits) depois de abrir a Galeria; sem isso a janela fica preta
+  app_commits=$(sed -n '/launch com.android.gallery3d/,$p' build/boot.log | grep -aoE 'compositor\] 10s: commits=[0-9]+' | cut -d= -f2 | paste -sd+ | bc)
+  [ "${app_commits:-0}" -ge 3 ] && echo "OK    app Android desenha na tela (${app_commits} quadros)" || { echo "FALTA app Android desenhar (${app_commits:-0} quadros; GPU=virgl?)"; fail=1; }
   grep -aq 'key back -> ok home' build/boot.log && echo "OK    voltar no app volta à tela inicial nativa" || { echo "FALTA voltar no app voltar à tela inicial nativa"; fail=1; }
   grep -aq 'launch com.android.gallery3d/[^ ]* -> ok' build/boot.log && echo "OK    launcher nativa abriu a Galeria (langedroid launch)" || { echo "FALTA launcher nativa abrir a Galeria"; fail=1; }
   [ "$touch_diff" -ge 2 ] && echo "OK    toque muda a tela (${touch_diff}% mudou; android/build/touch-post.png)" || { echo "FALTA toque muda a tela (${touch_diff}% mudou)"; fail=1; }

@@ -9,6 +9,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 if [ "${ARCH:-arm64}" = x86_64 ]; then
+  # apps Android só desenham com GPU de verdade (gralloc em software não aloca buffers): virgl por
+  # padrão, se o QEMU do sistema (com virglrenderer) existir. GPU= força o modo em software.
+  [ -x /usr/bin/qemu-system-x86_64 ] && GPU=${GPU-virgl}
   X86=1; T=x86_64-unknown-linux-musl; OUT=build/x86_64; KERNEL=../kernel/build/bzImage; GCC=gcc; DEV=pci; CON=ttyS0
 else
   X86=; T=aarch64-unknown-linux-musl; OUT=build; KERNEL=../kernel/build/Image; GCC=aarch64-linux-gnu-gcc; DEV=device; CON=ttyAMA0
@@ -92,7 +95,8 @@ BLK=("$OUT/system.erofs,id=sys,readonly=on" "$OUT/data.img,id=data" "${DISKS[@]}
 [ -n "$X86" ] || for ((i = 0, j = ${#BLK[@]} - 1; i < j; i++, j--)); do t=${BLK[i]}; BLK[i]=${BLK[j]}; BLK[j]=$t; done
 BLKARGS=(); for b in "${BLK[@]}"; do BLKARGS+=(-drive "file=$b,format=raw,if=none" -device "virtio-blk-$DEV,drive=$(sed -E 's/.*id=([a-z]+).*/\1/' <<<"$b")"); done
 if [ -n "$X86" ]; then
-  MACHINE=(qemu-system-x86_64 -M q35 -accel kvm -cpu host -vga none)  # sem VGA padrão: VNC mostra o virtio-gpu
+  Q86=qemu-system-x86_64; [ "${GPU:-}" = virgl ] && Q86=/usr/bin/$Q86
+  MACHINE=($Q86 -M q35 -accel kvm -cpu host -vga none)  # sem VGA padrão: VNC mostra o virtio-gpu
 else
   # virtio-mmio moderno (1.0): virtio-gpu recusa o transporte legado em silêncio.
   MACHINE=($QEMU -M virt -cpu cortex-a53 -global virtio-mmio.force-legacy=false)
