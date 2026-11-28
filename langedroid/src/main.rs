@@ -93,13 +93,18 @@ const DEV_NODES: [&str; 7] = ["null", "zero", "full", "random", "urandom", "tty"
 
 /// Política 64-bit only: remove ABIs 32-bit dos build.prop. Junto com zygote64_only, elimina o
 /// zygote32 residente; núcleos ARMv9 nem executam AArch32. Aplicada em cópias (imagem intacta).
+#[cfg(target_arch = "aarch64")]
+const ABI64: &str = "arm64-v8a";
+#[cfg(target_arch = "x86_64")]
+const ABI64: &str = "x86_64";
+
 fn abi64_only(build_prop: &str) -> String {
     let mut out = String::new();
     for line in build_prop.lines() {
         let key = line.split_once('=').map(|(k, _)| k.trim());
         match key {
             Some(k) if k.ends_with("cpu.abilist32") => continue,
-            Some(k) if k.ends_with("cpu.abilist") => { out.push_str(k); out.push_str("=arm64-v8a"); }
+            Some(k) if k.ends_with("cpu.abilist") => { out.push_str(k); out.push('='); out.push_str(ABI64); }
             _ => out.push_str(line),
         }
         out.push('\n');
@@ -263,6 +268,18 @@ fn enter_rootfs(root: &str, binds: &[(String, String)], wayland_dir: Option<&str
         }
     }
     Ok(())
+}
+
+const KEY_BACK: u16 = 158;
+const KEY_HOMEPAGE: u16 = 172;
+
+/// struct input_event (64-bit: timeval 16 bytes + type, code, value) como o FIFO do Waydroid espera.
+fn input_event(kind: u16, code: u16, value: i32) -> [u8; 24] {
+    let mut e = [0u8; 24];
+    e[16..18].copy_from_slice(&kind.to_ne_bytes());
+    e[18..20].copy_from_slice(&code.to_ne_bytes());
+    e[20..24].copy_from_slice(&value.to_ne_bytes());
+    e
 }
 
 const INPUT_FIFOS: [&str; 4] = ["wl_touch_events", "wl_pointer_events", "wl_keyboard_events", "wl_tablet_events"];
@@ -563,6 +580,15 @@ impl Container {
         }
     }
 
+    /// Aperta e solta uma tecla (EV_KEY + SYN) no FIFO de teclado do container.
+    fn press_key(&self, code: u16) -> Result<(), String> {
+        use std::io::Write;
+        let mut kb = self.fifos.get(2).ok_or("FIFO de teclado fechado")?;
+        let mut buf = Vec::with_capacity(96);
+        for v in [1, 0] { buf.extend(input_event(1, code, v)); buf.extend(input_event(0, 0, 0)); }
+        kb.write_all(&buf).map_err(|e| format!("FIFO de teclado: {e}"))
+    }
+
     /// Ajustes do Android p/ o shell do LangeOS, uma vez por boot (quando o Android já responde).
     fn android_setup(&mut self) {
         // O FIFO wl_keyboard_events do Waydroid aparece como teclado físico e o Android esconderia o
@@ -570,6 +596,10 @@ impl Container {
         match self.android_cmd(&["settings", "put", "secure", "show_ime_with_hard_keyboard", "1"]) {
             Ok(_) => { self.android_setup_done = true; eprintln!("[langedroid] android: teclado virtual sempre visível"); }
             Err(e) => eprintln!("[langedroid] android setup: {e}"),
+        }
+        // diálogo "app parou" do Android rouba o foco (engolia o voltar); o LangeOS avisa do jeito dele
+        if let Err(e) = self.android_cmd(&["settings", "put", "global", "hide_error_dialogs", "1"]) {
+            eprintln!("[langedroid] android setup: {e}");
         }
     }
 
@@ -607,15 +637,19 @@ impl Container {
             }
             "launch" if valid_component(arg) => self.android_cmd(&["activity", "start-activity", "-n", arg]).map(|_| String::new()),
             "key" => match arg {
-                // --async: não espera o app tratar a tecla (app ocupado/ANR travava o cmd até o timeout)
+                // tecla pelo FIFO de teclado do Waydroid (o Android lê como teclado físico). `cmd input
+                // keyevent` travava até o timeout com o gralloc em software.
                 // Voltar na 1ª tela do app leva p/ a launcher do Android: avisa o shell ("home") p/ ele
                 // mostrar a tela inicial nativa no lugar.
-                "back" => self.android_cmd(&["input", "keyevent", "--async", "4"]).map(|_| {
-                    thread::sleep(Duration::from_millis(800));
-                    let top = self.android_run("/system/bin/dumpsys", &["activity", "activities"]).unwrap_or_default();
-                    if top_is_home(&top) { "home".into() } else { String::new() }
+                "back" => self.press_key(KEY_BACK).map(|_| {
+                    // app pode levar um tempo p/ fechar: confere até ~5 s
+                    let home = (0..10).any(|_| {
+                        thread::sleep(Duration::from_millis(500));
+                        self.android_run("/system/bin/dumpsys", &["activity", "activities"]).is_ok_and(|d| top_is_home(&d))
+                    });
+                    if home { "home".into() } else { String::new() }
                 }),
-                "home" => self.android_cmd(&["input", "keyevent", "--async", "3"]).map(|_| String::new()),
+                "home" => self.press_key(KEY_HOMEPAGE).map(|_| String::new()),
                 _ => Err("tecla desconhecida".into()),
             },
             _ => Err(format!("comando do shell inválido: {line}")),
@@ -718,9 +752,11 @@ fn encode_notifs(n: &[(String, String)]) -> String {
 }
 
 /// `dumpsys activity activities`: a atividade no topo é a launcher do Android (HOME)?
+/// Nenhum app no topo = tela inicial. Sem atividade resumida também conta: a launcher do Android pode
+/// nem existir (trava no QEMU) e a tela inicial é do LangeOS.
 fn top_is_home(dump: &str) -> bool {
     dump.lines().find(|l| l.contains("topResumedActivity=") || l.contains("mResumedActivity:"))
-        .is_some_and(|l| l.contains("launcher") || l.contains("FallbackHome"))
+        .is_none_or(|l| l.contains("launcher") || l.contains("FallbackHome") || l.trim_end().ends_with("null"))
 }
 
 /// pacote/atividade só com [A-Za-z0-9._$/]: nada de espaço/opção vindo do cliente vira argumento do cmd.
@@ -861,6 +897,8 @@ mod shell_tests {
         assert_eq!(encode_notifs(&[("a\x1eb".into(), "c".into())]), "a b\x1fc");
         assert!(top_is_home("  x\n      topResumedActivity=ActivityRecord{6fa u0 com.android.launcher3/.uioverrides.QuickstepLauncher} t6}"));
         assert!(!top_is_home("      topResumedActivity=ActivityRecord{6fa u0 com.android.gallery3d/.app.GalleryActivity t7}"));
+        assert!(top_is_home("      topResumedActivity=null"));
+        assert!(top_is_home("nada aqui"));
     }
 }
 
@@ -890,7 +928,9 @@ mod tests {
     #[test]
     fn abi64() {
         let p = abi64_only("# c\nro.vendor.product.cpu.abilist=arm64-v8a,armeabi-v7a,armeabi\nro.vendor.product.cpu.abilist32=armeabi-v7a,armeabi\nro.vendor.product.cpu.abilist64=arm64-v8a\nro.zygote=zygote64_32\nfoo=bar\n");
-        assert_eq!(p, "# c\nro.vendor.product.cpu.abilist=arm64-v8a\nro.vendor.product.cpu.abilist64=arm64-v8a\nro.zygote=zygote64_32\nfoo=bar\n");
+        let e = input_event(1, KEY_BACK, 1);
+        assert_eq!((&e[16..18], &e[18..20], &e[20..24]), (&1u16.to_ne_bytes()[..], &158u16.to_ne_bytes()[..], &1i32.to_ne_bytes()[..]));
+        assert_eq!(p, format!("# c\nro.vendor.product.cpu.abilist={ABI64}\nro.vendor.product.cpu.abilist64=arm64-v8a\nro.zygote=zygote64_32\nfoo=bar\n"));
         let props = [("ro.hardware.egl".to_string(), "mesa".to_string()), ("new.k".to_string(), "1".to_string())];
         assert_eq!(set_props("a=1\nro.hardware.egl=x\n", &props), "a=1\nro.hardware.egl=mesa\nnew.k=1\n");
         let rc = "service zygote /a64\n    class main\n\nservice zygote_secondary /a32\n    class main\n";

@@ -4,43 +4,44 @@
 # GPU=virgl: GPU 3D do host via virglrenderer (QEMU do apt, -display egl-headless). Padrão: 2D + Mesa em software.
 # VNC=n: tela em VNC na porta 5900+n (ex.: VNC=1 -> vncviewer :1), mouse vira toque.
 # ANDROID=1: + system/vendor do Waydroid (../android/fetch.sh) e container Android aberto no boot.
+# ARCH=x86_64: teste rápido no PC com KVM (kernel build/bzImage, imagens android/build/x86_64). ARM continua o alvo.
 # Apagar build/data.img zera os dados persistentes.
 set -euo pipefail
 cd "$(dirname "$0")"
-OUT=build
-KERNEL=../kernel/build/Image
-[ -f "$KERNEL" ] || { echo "falta $KERNEL: rode ../kernel/build.sh" >&2; exit 1; }
+if [ "${ARCH:-arm64}" = x86_64 ]; then
+  X86=1; T=x86_64-unknown-linux-musl; OUT=build/x86_64; KERNEL=../kernel/build/bzImage; GCC=gcc; DEV=pci; CON=ttyS0
+else
+  X86=; T=aarch64-unknown-linux-musl; OUT=build; KERNEL=../kernel/build/Image; GCC=aarch64-linux-gnu-gcc; DEV=device; CON=ttyAMA0
+fi
+[ -f "$KERNEL" ] || { echo "falta $KERNEL: rode ${X86:+ARCH=x86_64 }../kernel/build.sh" >&2; exit 1; }
 
 R=$OUT/rootfs; rm -rf "$R"
 mkdir -p "$R"/{sbin,bin,proc,sys,dev,data,run,android/root,etc/lange/services}
-for c in lange-init langedroid lange-compositor; do (cd ../$c && cargo build -q --release --target aarch64-unknown-linux-musl); done
-cp ../lange-init/target/aarch64-unknown-linux-musl/release/lange-init "$R/sbin/init"
-cp ../langedroid/target/aarch64-unknown-linux-musl/release/langedroid "$R/bin/langedroid"
-cp ../lange-compositor/target/aarch64-unknown-linux-musl/release/lange-compositor "$R/bin/lange-compositor"
-cc() { aarch64-linux-gnu-gcc -static -Os -o "$R/bin/$1" "$1.c"; }
+for c in lange-init langedroid lange-compositor; do (cd ../$c && cargo build -q --release --target $T); done
+cp ../lange-init/target/$T/release/lange-init "$R/sbin/init"
+cp ../langedroid/target/$T/release/langedroid "$R/bin/langedroid"
+cp ../lange-compositor/target/$T/release/lange-compositor "$R/bin/lange-compositor"
+cc() { $GCC -static -Os -o "$R/bin/$1" "$1.c"; }
 cc heartbeat; cc memhog; cc droid-payload
 printf '/dev/vdb /data ext4 rw\ntmpfs /run tmpfs rw\n' > "$R/etc/lange/fstab"
 S=$R/etc/lange/services
 printf 'exec=/bin/heartbeat\nrestart=always\n' > "$S/00-heartbeat.svc"
 printf 'exec=/bin/memhog\nrestart=never\nmemory_max=16M\n' > "$S/50-memhog.svc"
-DISKS=(); CMDLINE_EXTRA=
+DISKS=(); EXTRA_DEV=(); CMDLINE_EXTRA=
 QEMU=qemu-system-aarch64
-GPU_DEV=(-device virtio-gpu-device -device virtio-multitouch-device -netdev user,id=net0 -device virtio-net-device,netdev=net0)  # 2D: Mesa renderiza por software (llvmpipe/kms_swrast)
+GPU_DEV=(-device virtio-gpu-$DEV -device virtio-multitouch-$DEV -netdev user,id=net0 -device virtio-net-$DEV,netdev=net0)  # 2D: Mesa renderiza por software (llvmpipe/kms_swrast)
 if [ "${GPU:-}" = virgl ]; then
   QEMU=/usr/bin/qemu-system-aarch64  # QEMU do Ubuntu tem virglrenderer; o do Homebrew não
-  GPU_DEV=(-device virtio-gpu-gl-device -display egl-headless -device virtio-multitouch-device -netdev user,id=net0 -device virtio-net-device,netdev=net0)
+  GPU_DEV=(-device virtio-gpu-gl-$DEV -display egl-headless -device virtio-multitouch-$DEV -netdev user,id=net0 -device virtio-net-$DEV,netdev=net0)
 fi
 # VNC manda o mouse como ponteiro absoluto, que o multitouch ignora: tablet no lugar (um dedo só)
-[ -n "${VNC:-}" ] && GPU_DEV=("${GPU_DEV[@]/virtio-multitouch-device/virtio-tablet-device}")
+[ -n "${VNC:-}" ] && GPU_DEV=("${GPU_DEV[@]/virtio-multitouch-$DEV/virtio-tablet-$DEV}")
 if [ -n "${ANDROID:-}" ]; then
-  A=../android/build
-  [ -f $A/system.img ] && [ -f $A/vendor.img ] || { echo "falta imagem Android: rode ../android/fetch.sh" >&2; exit 1; }
+  A=../android/build${X86:+/x86_64}
+  [ -f $A/system.img ] && [ -f $A/vendor.img ] || { echo "falta imagem Android: rode ${X86:+ARCH=x86_64 }../android/fetch.sh" >&2; exit 1; }
   [ -f $A/data.img ] || mkfs.ext4 -q -F $A/data.img 4G  # esparso: ocupa só o usado
-  # vdc/vdd/vde (ordem de enumeração invertida: ver comentário no qemu abaixo)
-  DISKS=(-drive file=$A/data.img,format=raw,if=none,id=adata -device virtio-blk-device,drive=adata
-         -drive file=$A/vendor.img,format=raw,if=none,id=avendor,readonly=on -device virtio-blk-device,drive=avendor
-         -drive file=$A/system.img,format=raw,if=none,id=asys,readonly=on -device virtio-blk-device,drive=asys
-         "${GPU_DEV[@]}")
+  DISKS=("$A/system.img,id=asys,readonly=on" "$A/vendor.img,id=avendor,readonly=on" "$A/data.img,id=adata")  # vdc/vdd/vde
+  EXTRA_DEV=("${GPU_DEV[@]}")
   # ícones dos apps: helper Java renderizado pelo Android (langedroid `icons`)
   ../android/icons/build.sh && mkdir -p "$R/usr/share/lange" && cp ../android/icons/build/lange-icons.jar "$R/usr/share/lange/"
   printf '/dev/vdc /android/root ext4 ro\n/dev/vdd /android/root/vendor ext4 ro\n/dev/vde /android/root/data ext4 rw\n' >> "$R/etc/lange/fstab"
@@ -86,11 +87,16 @@ fi
 mkfs.erofs --quiet -zlz4 --all-root "$OUT/system.erofs" "$R" >/dev/null
 [ -f "$OUT/data.img" ] || mkfs.ext4 -q -F "$OUT/data.img" 64M
 
-# virtio-mmio moderno (1.0): virtio-gpu recusa o transporte legado em silêncio.
-# virtio-mmio no virt enumera ao contrário: último -device vira vda. Por isso data antes de system.
-${1:+timeout $1} $QEMU -M virt -cpu cortex-a53 -smp "${SMP:-4}" -m "${MEM:-1024}" -nographic ${VNC:+-vnc :$VNC} -no-reboot \
-  -global virtio-mmio.force-legacy=false \
-  -kernel "$KERNEL" "${DISKS[@]}" ${QMP:+-qmp unix:$QMP,server=on,wait=off} \
-  -drive file="$OUT/data.img",format=raw,if=none,id=data -device virtio-blk-device,drive=data \
-  -drive file="$OUT/system.erofs",format=raw,if=none,id=sys,readonly=on -device virtio-blk-device,drive=sys \
-  -append "console=ttyAMA0 root=/dev/vda rootfstype=erofs ro init=/sbin/init ${QUIET-quiet} panic=-1 $CMDLINE_EXTRA"
+# discos na ordem vda, vdb, ... PCI enumera na ordem da linha; virtio-mmio do virt ao contrário.
+BLK=("$OUT/system.erofs,id=sys,readonly=on" "$OUT/data.img,id=data" "${DISKS[@]}")
+[ -n "$X86" ] || for ((i = 0, j = ${#BLK[@]} - 1; i < j; i++, j--)); do t=${BLK[i]}; BLK[i]=${BLK[j]}; BLK[j]=$t; done
+BLKARGS=(); for b in "${BLK[@]}"; do BLKARGS+=(-drive "file=$b,format=raw,if=none" -device "virtio-blk-$DEV,drive=$(sed -E 's/.*id=([a-z]+).*/\1/' <<<"$b")"); done
+if [ -n "$X86" ]; then
+  MACHINE=(qemu-system-x86_64 -M q35 -accel kvm -cpu host -vga none)  # sem VGA padrão: VNC mostra o virtio-gpu
+else
+  # virtio-mmio moderno (1.0): virtio-gpu recusa o transporte legado em silêncio.
+  MACHINE=($QEMU -M virt -cpu cortex-a53 -global virtio-mmio.force-legacy=false)
+fi
+${1:+timeout $1} "${MACHINE[@]}" -smp "${SMP:-4}" -m "${MEM:-1024}" -nographic ${VNC:+-vnc :$VNC} -no-reboot \
+  -kernel "$KERNEL" "${BLKARGS[@]}" "${EXTRA_DEV[@]}" ${QMP:+-qmp unix:$QMP,server=on,wait=off} \
+  -append "console=$CON root=/dev/vda rootfstype=erofs ro init=/sbin/init ${QUIET-quiet} panic=-1 $CMDLINE_EXTRA"
